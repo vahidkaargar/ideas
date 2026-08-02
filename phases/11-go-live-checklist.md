@@ -1,4 +1,4 @@
-[Plan index](../dns-server-plan.md) · [Previous: Privacy, Retention and Compliance (optional)](./10-privacy-and-compliance.md)
+[Plan index](../dns-server-plan.md) · [Previous: Privacy, Retention and Compliance (optional)](./10-privacy-and-compliance.md) · [Next: Client Configuration](./12-client-setup.md)
 
 ---
 
@@ -64,8 +64,63 @@ Rules for running it:
 ```
 [ ] Ubuntu 24.04 LTS, not 22.04                      lsb_release -ds                        (A1)
 [ ] Public IPv4 survives a reboot; IP matches DNS    ip -4 addr show scope global            (A1)
+[ ] dns.example.com resolves to THIS host from TWO independent public resolvers               (0.1, D0)
+       dig +short dns.example.com A @1.1.1.1 ; dig +short dns.example.com A @8.8.8.8
+       -- both must return the address on the line above. One resolver proves nothing: it can
+          be serving a cached answer from a previous holder of the name. A mismatch here is a
+          stop, not a retry -- each failed HTTP-01 burns one of Let's Encrypt's five failed
+          validations per hostname per hour, and D2 is where you discover that.
+[ ] The zone for that name is served by authoritative DNS that is NOT this machine, on at
+    least two nameservers, and the A/AAAA TTL is 300                                          (0.1, D0)
+       dig +noall +answer dns.example.com A @$(dig +short NS example.com | head -1)
+       -- read the TTL from an AUTHORITATIVE answer; a cached one is counting down and lies.
+          This box is authoritative for nothing -- Unbound refuses 0.0.0.0/0 on :5335 and no
+          phase writes an auth-zone -- so hosting the zone here makes the name die with the
+          host, taking every DoT/DoQ/DoH client, both I9 external monitors and the N8 cutover
+          with it. 300 s is what K7 step 7 and escalation step 6 each spend repointing the
+          record: it has to be low ALREADY, because lowering it during the incident is too late.
+[ ] IPv6 posture DECIDED and recorded, and the RECORD SET matches it            (A1, C2, E2a)
+       -- the listener is not the variable. `dns.bind_hosts: [0.0.0.0]` is a WILDCARD, and Go
+          resolves a wildcard listen address to an AF_INET6 socket with `IPV6_V6ONLY=0` set
+          explicitly (`net/ipsock_posix.go`, `net/sockopt_linux.go`), so Do53, DoT and DoQ
+          ALREADY answer over both families on the file exactly as Phase E ships it. E4's
+          nginx is the opposite shape on purpose and binds `0.0.0.0` and `[::]` separately;
+          Phase B's `inet` ruleset accepts both. What the posture decides is therefore which
+          RECORDS to publish -- and, separately, whether Phase C's `do-ip6` EGRESS works.
+          Three postures are coherent:
+            (a) IPv4-only  -- publish NO AAAA for dns.example.com anywhere, including the one
+                P3c adds "if the VPS has IPv6". The wildcard socket still accepts v6 from
+                anyone who learns the address another way; that is not a leak on a
+                deliberately public resolver, but it does keep Phase B's v6 ban path
+                load-bearing.
+            (b) dual-stack -- publish the AAAA, and prove it with the next line.
+            (c) IPv4-only ENFORCED at the socket -- `bind_hosts: [<PUBLIC_IPV4>]`. A literal
+                is not a wildcard, so this is the ONLY setting that yields a genuine AF_INET
+                socket. Read Phase N before choosing it: AdGuardHome then refuses to start
+                whenever that address is not yet on an interface, which is exactly the state
+                a floating-IP standby is in.
+          Do NOT "add IPv6" by writing `bind_hosts: [0.0.0.0, '::']`. dnsproxy sets
+          SO_REUSEADDR and SO_REUSEPORT on every listener, so that binds `[::]:53` a second
+          time, succeeds silently, and buys nothing. It is not the dual-stack fix (E2a).
+[ ] EVERY published address answers on EVERY transport this build enables          (E2a, E6-9)
+       run E6 step 9 from a DUAL-STACK host -- see the L5 [off-box] line, which is where it
+       is executed. It derives its address list from `dig +short dns.example.com A/AAAA`
+       rather than from a $PUB variable, precisely so that it fails on a record that no
+       listener owns. If it reports a blank column, fix the listener or withdraw the record.
+       ss -lntuep '( sport = :53 or sport = :853 )'                                    (E2a)
+       -> AdGuardHome renders as `*:53` / `*:853` with `v6only:0` on a dual-stack host. A
+          literal `0.0.0.0:53` means Go could not open an AF_INET6 socket at all, i.e. this
+          host has NO usable IPv6 stack -- which is a legitimate state, and the one in which
+          an AAAA must not exist.
 [ ] chrony synchronised, offset < 100 ms             chronyc tracking                        (A2)
        -- clock skew SERVFAILs every signed zone and presents as a total outage
+[ ] NO chrony source is a hostname -- the time path must not depend on the DNS path           (A2)
+       chronyc sources -v                         -> numeric addresses only
+       grep -rhE '^(server|pool)' /etc/chrony/     -> nothing that requires resolution
+       -- after C5.8 the host resolves through its own validator, and a validator with a skewed
+          clock SERVFAILs the NTP pool's own name. IP-literal sources plus `makestep` are the
+          only things that stop the deadlock forming; once it has formed the exit is a console
+          `date -s`, which is why that recovery row exists in the runbook.
 [ ] ufw and fail2ban absent (or fail2ban on the nftables banaction)                          (A2, A4)
 [ ] systemd-resolved disabled AND masked; port 53 free   ss -lnup 'sport = :53'              (A2)
 [ ] No /etc/systemd/resolved.conf.d/ on the host -- no phase writes DNSStubListener          (A2, C1)
@@ -162,12 +217,52 @@ Rules for running it:
 [ ] modules: validator iterator                      unbound-control status                   (C5.2)
 [ ] auto-trust-anchor-file declared exactly ONCE     grep -rhc ... | paste -sd+ - | bc  -> 1  (C3)
 [ ] root.key non-empty, unbound:unbound 0644, in the restic include list                      (C3, K3)
+[ ] Trust anchor STATE inspected, not merely its size                                         (C3)
+       grep ';;state=' /var/lib/unbound/root.key
+       -> at least one key at `;;state=2 [  VALID  ]`. 1 = ADDPEND (seen, not yet through its
+          30-day hold-down), 3 = MISSING, 4 = REVOKED, 5 = REMOVED.
+       -- `test -s root.key` and an AD flag on `. DNSKEY` BOTH pass for the whole of an RFC 5011
+          rollover, including on a host that will SERVFAIL every signed name the day ICANN
+          revokes the old KSK. During a roll the new key must reach VALID BEFORE the old one is
+          revoked; a box powered off for longer than the hold-down never sees it and has to be
+          re-bootstrapped by hand. This is the one service-killing event on this stack that
+          arrives with a published calendar date.
+[ ] root.key was rewritten within the last 90 days                                            (C3)
+       find /var/lib/unbound/root.key -mtime +90    -> no output
+       -- RFC 5011 tracking rewrites the file routinely, so a stale mtime means tracking has
+          stopped while every other anchor check still passes.
+[ ] The monthly anchor-state line was APPENDED to /etc/cron.d/dns-health, and the ICANN
+    rollover announcements are subscribed and calendared next to the K6/K7 drills             (C3, I10, O6)
+[ ] dns-root-data is not frozen -- M1's security-pocket scope structurally excludes it         (M1, C3)
+       find /usr/share/dns/root.hints -mtime +365   -> no output
+       -- it carries root.hints and the ICANN bundle the C3 heal path validates against, so a
+          frozen copy degrades priming and the heal path together, silently.
 [ ] unbound-anchor-guard.timer enabled and does NOT touch a healthy anchor                    (C3)
 [ ] The two DNSSEC fast-detector lines were APPENDED to /etc/cron.d/dns-health,
     not dropped into a second cron file                                                       (C3, I10)
 [ ] 18 private-address lines + 1 private-domain line                                          (C2, H7)
 [ ] edns-buffer-size and max-udp-size both 1232      unbound-control get_option ...           (C2)
 [ ] qname-minimisation yes, strict no                unbound-control get_option ...           (C2, C5.4)
+[ ] do-ip6 matches this host's actual IPv6 EGRESS, tested rather than assumed                 (C2)
+       ip -6 route show default
+       dig @2001:500:2f::f . NS +time=3 +tries=1 ; dig @2001:500:1::53 . NS +time=3 +tries=1
+       -> both root letters answer inside 3 s -> `do-ip6: yes`. Either times out -> `do-ip6: no`,
+          recorded WITH the reason, because someone will "fix" it back later.
+       -- a global v6 address with dead transit is the common provider trap, and `ip -6 addr`
+          passes on exactly that host. The cost is a timeout per query to every v6-reachable
+          authoritative on every cache miss: degradation, not failure, so it survives launch and
+          surfaces months later as an unattributed RecursionLatencyP99High.
+[ ] NO `domain-insecure:` in any drop-in -- a negative trust anchor is RUNTIME-ONLY by design  (C3b, O4)
+       grep -rn 'domain-insecure' /etc/unbound/    -> no output
+       unbound-control list_insecure               -> empty, or every entry carries a ticket
+                                                      and an expiry date recorded against it
+       -- a persisted NTA disables validation for that zone forever and silently, which voids
+          the single property this build exists to provide.
+[ ] The C3b procedure is in the runbook and its discriminator is understood                    (C3b)
+       -- OUR anchor broken = EVERY signed zone SERVFAILs. THEIR zone broken = ONE zone
+          SERVFAILs, with EDE 6/7/8/9/10 on the answer. Matching the second case against the
+          first sends the operator to `unbound-anchor` plus a cache-dumping restart for a fault
+          neither one can fix.
 [ ] verbosity is 1 (NOT 0) and use-syslog is no -- unbound logs to journald                   (C2, G, Q3)
 [ ] Remote control is ENABLED on the shipped unix socket, and no second control channel
     was added on tcp/8953                                                                     (C2, I2, Q3)
@@ -186,6 +281,41 @@ Rules for running it:
 ### L4. TLS certificates
 
 ```
+[ ] CAA state was checked BEFORE the first issuance attempt                                   (D2)
+       dig +short CAA dns.example.com ; dig +short CAA example.com
+       -> empty everywhere, or a set containing `0 issue "letsencrypt.org"`.
+       -- a CA climbs to the first ancestor that HAS a record and stops, so the apex governs
+          whenever the label carries none. A non-empty set that omits letsencrypt.org is a hard
+          refusal whose error text mentions neither DNS nor the firewall, and it spends one of
+          the five attempts per hostname per hour finding that out.
+[ ] CAA PUBLISHED after issuance, and issuewild matches the D7 / P3c decision          (D2, D8, D7)
+       example.com.  300  IN  CAA  0 issue     "letsencrypt.org"
+       example.com.  300  IN  CAA  0 issuewild ";"        <- relax to "letsencrypt.org" ONLY
+                                                             if Phase P selected the wildcard
+       example.com.  300  IN  CAA  0 iodef     "mailto:<the Q5c security contact>"
+       -- empty is a pass at the gate but not a good state: with no CAA, any of roughly ninety
+          public CAs may issue for the one name that is the ENTIRE client authentication of
+          DoT, DoQ and DoH. Android Private DNS pins nothing, and D6 records that Let's Encrypt
+          shut its OCSP responders down on 2025-08-06 -- so a mis-issued certificate has no
+          revocation any client will act on. CT detects mis-issuance afterwards; CAA prevents it.
+       -- ordering trap: relaxing issuewild must happen BEFORE certbot runs the DNS-01 switch.
+[ ] Domain expiry is MONITORED, not remembered                                        (I4, I6, O6)
+       dns-domain-expiry on /etc/cron.d/dns-health; DomainExpiringSoon (60 d) and
+       DomainExpiringCritical (30 d) loaded; DomainExpiryCheckFailing loaded too
+       curl -fsSL --max-time 20 https://rdap.org/domain/example.com \
+         | jq -r '.events[]|select(.eventAction=="expiration")|.eventDate'
+       -- `-L` is not optional: rdap.org is the bootstrap redirector and answers 302 to the
+          responsible registry. This is the only expiry in the design nothing else covers --
+          CertExpiringSoon fires on a name you no longer own with no fixable cause, and after
+          the redemption window anyone may re-register it, obtain a valid certificate, and
+          receive the queries of every device still configured to trust it.
+[ ] Registrar: auto-renew ON, registrar lock ON, account MFA on, recovery email and the
+    renewal card's OWN expiry date recorded in the Phase O inventory                          (O6)
+       -- a lapsed payment card is the usual root cause, and it fails silently.
+[ ] A probe resolves dns.example.com against a PUBLIC resolver, not 127.0.0.1                 (I4, I9)
+       -- every other DNS probe in I4 targets 127.0.0.1:53 and therefore cannot see a failure
+          of the third-party authoritative DNS that serves this name. When that zone goes down,
+          the box, dns-smoke.sh and every on-box probe stay green while every client fails.
 [ ] Certificate is ECDSA P-256                       openssl x509 ... Public Key Algorithm    (D9-1)
 [ ] SANs are exactly what you intended (wildcard only if Phase P uses ClientID SNI)           (D9-2)
 [ ] Renewal authenticator is webroot or dns-*, NEVER standalone                               (D9-3)
@@ -246,9 +376,28 @@ Rules for running it:
 [ ] [off-box] /control/status, /login.html, /install.html, /apple/* ALL return 404              (E6-5, H2)
        -- a JSON body from /control/status is a stop-the-build defect
 [ ] [off-box] DoT and DoQ resolve with kdig >= 3.3                                              (H3, H4)
+[ ] [off-box, DUAL-STACK host] E6 step 9: every address published for dns.example.com
+    answers Do53, DoT, DoQ and DoH                                             (E2a, E6-9, L1)
+       -- this is the only dual-stack sweep in the plan; the H-series transport tests have no
+          v6 variants and none are needed, because step 9 already runs all four transports
+          against every advertised address. It reads that address list out of DNS instead of
+          a $PUB variable, so it fails exactly when a record has been published that no
+          listener owns. PASS is every column populated on every row, DoH=200. A blank column
+          is a FAIL, not a partial pass: an RFC 6724 client prefers the AAAA, pays a connect
+          timeout per attempt, and a v6-only client is hard-broken. The usual shape is the
+          whole AAAA row blank except DoH -- nginx binds `[::]:443` explicitly while the
+          Do53/DoT/DoQ wildcard socket lost its v6 half, which means the HOST's v6 stack is
+          gone, not that `bind_hosts` is v4-only. Fix the listener or withdraw the record.
 [ ] [off-box] Forged XFF / Host does NOT change the identity in the query log                   (E6-6)
 [ ] With unbound stopped, the public edge SERVFAILs -- it never answers from anywhere else      (E6-7, H5)
 [ ] version.bind returns REFUSED (not SERVFAIL, not an answer)                                  (E6-7, P1)
+[ ] [off-box] trustanchor.unbound returns REFUSED too -- it is the FOURTH CHAOS probe           (C2, E2)
+       kdig @<PUBLIC_IP> -c CH -t TXT trustanchor.unbound
+       -- `hide-trustanchor` defaults to NO and the name is not in AdGuardHome's blocked_hosts,
+          so without C2's line the resolver hands out its anchor state after the other three
+          probes were made to lie. The guarantee is carried by `hide-trustanchor` and nothing
+          else: the Phase P rewrite of the dns: block is exactly where blocked_hosts entries
+          get lost.
 ```
 
 ### L6. Validation and load
@@ -269,6 +418,16 @@ alone also passes on a host whose trust anchor is so broken that nothing resolve
 [ ] Leaf + intermediate served (a leaf-only chain works in browsers and breaks DoT clients)     (H9)
 [ ] Rate limiting drops the flooder and NOT a neighbour in the same /24                         (H10)
 [ ] The H10 set check finds all six sets in table inet filter and no second table               (H10)
+[ ] H13 upstream/root-outage injection RUN, with all four numbers recorded                      (H13, C5.6)
+       -- serve-expired is the plan's only graceful-degradation mechanism, and it is otherwise
+          configured, costed in prose and never made to fire. Record: (1) :5335 still ANSWERS
+          from stale rather than SERVFAILing; (2) the answer carries `; EDE: 3 (Stale Answer)`
+          and a 30 s TTL; (3) num.expired has risen above zero; (4) Query time is roughly
+          1800 ms -- the serve-expired-client-timeout cost measured on THIS host, not quoted.
+[ ] H13 also recorded what the MONITORING did                                                   (H13, I6)
+       which of RecursionStalled / ServfailRateHigh / RecursionLatencyP99High fired, whether
+       dns-smoke.sh passed, and on Tier 3 whether the vrrp_script entered FAULT
+[ ] H13 restore proven: injection rule deleted by handle, dns-smoke.sh -> SMOKE: PASS           (H13)
 [ ] dns-smoke.sh exits 0 with SMOKE: PASS                                                       (H12)
 [ ] dns-smoke.sh has been SEEN TO FAIL at least once (stop unbound, stop nginx, restore)        (H12)
 [ ] All four pre-change gates exit 0                                                            (H12)
@@ -280,6 +439,19 @@ alone also passes on a host whose trust anchor is so broken that nothing resolve
           artifacts, and root-owned artifacts under an adguardhome-owned tree break the next
           real start. Confirm /opt/adguardhome/validate exists and is adguardhome-owned 0750
           before relying on this gate (Phase O3 creates it).
+[ ] At least one REAL device per transport in use was configured FROM the Phase R strings and
+    resolves through this host end to end                                                       (R1, R3-R7)
+       Android Private DNS (R3 — DoT/853, hostname only, fails closed, no fallback) · an Apple
+       configuration profile (R4 — there is no system-wide UI) · Windows 11 (R5 — the resolver
+       IP and the DoH template are registered as a PAIR) · one browser (R7)
+       -- kdig passing is not evidence that any of these work. Each platform accepts a different
+          subset of the four endpoint forms, several accept none without a profile, and a
+          browser's own DoH silently discards whatever the OS was just told. A service that
+          passes every test above and that nobody can onboard has not shipped.
+[ ] R12's "am I actually reaching this resolver, with validation on" check was run FROM the
+    client, not from the server                                                                 (R12)
+[ ] The transport ranking in R2 is the one handed to users -- DoH/443 first, because DoT and
+    DoQ on 853 are blocked outright on much of the hostile-network surface                      (R2)
 ```
 
 **H11 load-test thresholds.** Every run is executed from the H0 test host with the server-side
@@ -336,8 +508,19 @@ instrumentation running. Record `RTT_base` first; LT-1 is stated relative to it.
     service to page you.** Without this you have a dashboard, not monitoring.                      (I11-14, I9)
 [ ] A SECOND, independent external check exists (port monitor on :853 from outside)                (I9)
        -- catches "the box talks to itself but the internet cannot reach it"
+[ ] chrony is in dns-smoke.sh's UNITS list, so is-active/is-enabled are checked on every
+    restart, upgrade, reboot and restore                                                           (H12, I6)
+       -- chrony left disabled after a manual fix is exactly the M7 failure class the plan
+          already guards for the other four units.
+[ ] ClockUnsynchronised and ClockOffsetHigh are LOADED rules, and one has been seen to fire       (I6)
+       systemctl stop chrony && date -s '+3 days'   -> every signed name SERVFAILs while
+       root.key is intact and the alert fires; then systemctl start chrony && chronyc makestep,
+       then re-run dns-smoke.sh
+       -- a dead clock and a dead trust anchor produce the SAME symptom. Without these two rules
+          the runbook's trust-anchor row sends the operator to `unbound-anchor` and a
+          cache-dumping restart for a fault neither one can fix.
 [ ] Both external services, their credentials location and their notification targets are
-    recorded in the Phase O inventory                                                              (I9)
+    recorded in the Phase O inventory                                                              (I9, O6)
 [ ] /usr/local/sbin/notify.sh exists, is 0750 root:root, and a self-test reached the phone          (I8b, I11-15)
        -- this is the SINGLE notification entry point. Phase D, G, H, K, L, M, N and Q all call
           it; no phase ships a second one. Exit 3 = NTFY_URL unset, exit 4 = push failed, and a
@@ -348,7 +531,9 @@ instrumentation running. Record `RTT_base` first; LT-1 is stated relative to it.
     created a second cron file beside it                                                            (I10)
        expected lines: dns-health daily gate (I10), diskguard (G4), smoke gate (H12),
        restore drill (K6), reboot-pending (M6), is-enabled guard + hold guard (M7),
-       restart-churn detector (N4c), and the two DNSSEC detectors (C3)
+       restart-churn detector (N4c), the two DNSSEC detectors (C3), the monthly anchor-state
+       and root.hints staleness checks (C3, M1), the weekly domain-expiry check (I4), and the
+       weekly release watch (I4c)
 [ ] dns-health exits 0                                                                              (I10, I11-17)
 [ ] SLO targets agreed and written down; error-budget policy accepted                               (I7)
 ```
@@ -396,6 +581,19 @@ instrumentation running. Record `RTT_base` first; LT-1 is stated relative to it.
 [ ] restic repo initialised; `restic cat config` opens it                                            (K2)
 [ ] **The repository password is in the password manager.** No escrow exists. Losing it loses
     every backup ever taken.                                                                          (K2)
+[ ] Second operator exists and has been PROVEN, or the single-operator exposure is recorded as
+    accepted, with a date, in the Phase O inventory                                                   (K8, O6)
+       [ ] `restic key add` gave the second holder their OWN password (revocable with
+           `restic key remove`), and K2's object-storage credential reached them too -- without
+           it the key opens nothing
+       [ ] a second Alertmanager receiver and a second dead man's switch target reach a
+           DIFFERENT human on a DIFFERENT device, and I11-14 was re-proven against it
+       [ ] a second SSH admin key was added and proven with A4's own two-session procedure
+       [ ] the absence procedure has been run once
+       -- as shipped, K2 has no escrow, K7's pass criterion is literally "no value came from
+          outside the password manager", and Alertmanager has one topic on one phone. Every
+          drill in this plan is written for one person and passes for one person, which is
+          exactly why this failure is invisible until the person is unavailable.
 [ ] Object-storage credential scoped to one bucket; delete rights withheld where expressible          (K2)
 [ ] /etc/letsencrypt backed up WHOLE (archive included), root.key included                            (K3)
 [ ] /etc/prometheus, /etc/alertmanager and /etc/blackbox_exporter are in the include list             (K3)
@@ -421,10 +619,47 @@ instrumentation running. Record `RTT_base` first; LT-1 is stated relative to it.
        [ ] served certificate is the RESTORED one, not a silently re-issued one
        [ ] no step needed SSH to production and no value came from outside the password manager
        [ ] wall clock inside the O5 target                     measured: ______ minutes
-[ ] That measured number is written into the runbook as the real RTO                                    (K7, O5)
+[ ] That measured number is written into the runbook as the real RTO -- and it EXCLUDES DNS
+    propagation, so for Tier 0/1 add the A-record TTL to it                                             (K7, O5, D0)
+[ ] **H14 rollback rehearsal RUN on a healthy host**, not merely present in the script          (H14, M3)
+       measured: ______ seconds  -- that number is the rollback RTO and belongs in the runbook
+       next to K7's. Assert after: `readlink -f /opt/adguardhome/current` is the PREVIOUS
+       release; `schema_version` in AdGuardHome.yaml is the OLD number, proving the
+       pre-migration copy was restored and not the migrated one; the file is
+       adguardhome:adguardhome 0600; dns-smoke.sh exits 0 against the rolled-back version.
+       -- rollback is the only automated recovery mechanism in this plan that nothing else
+          exercises. Its branch runs for the first time at 03:00 with the service already down,
+          and if it fails there the operator is in an unplanned K7 rebuild.
+[ ] Unbound rollback rehearsed, and the apt-mark hold interaction is UNDERSTOOD                 (H14, M4, M7)
+       -- a rollback pins with `apt-mark hold`, which M7's hourly guard then flags as a defect.
+          Do not clear the hold during the incident. Confirm the held version actually starts
+          against the drop-in on disk, and record how the hold is released once you fix forward.
+[ ] The Phase O operational inventory EXISTS and every row has an answer and a date              (O6)
+       /opt/dns-config-backup/INVENTORY.md, committed; the unanswered-row check is clean and
+       `git log -1` on it is recent
+       -- I4, I9, J9 and L7 all say "record it in the Phase O inventory". This is the file they
+          mean. Sections: accounts and who ELSE can reach them; external dependencies with their
+          notification target and renewal date; the installed version of every out-of-apt binary
+          (which is also the release-watch input); and the measured numbers the plan asks for
+          and otherwise leaves loose -- the K7 rebuild clock, the H14 rollback clock, the P8d
+          revocation time, the H11 capacity knee.
 [ ] unattended-upgrades restricted to the security pockets; Automatic-Reboot false (single node)        (M1)
 [ ] needrestart in automatic mode; it will bounce unbound/nginx on a libc or OpenSSL update             (M2)
 [ ] upgrade-adguardhome.sh and upgrade-unbound.sh installed, and each rolls back on smoke failure       (M3, M4)
+[ ] Release watch is ACTIVE for all six out-of-apt daemons                                             (I4c)
+       AdGuardHome, restic, prometheus, node_exporter, alertmanager, blackbox_exporter
+       -- Phase M ends at M7 and ships no release watch; I4c owns it, alongside the RDAP
+          domain-expiry check, because both are slow external calendars rather than host state.
+          unattended-upgrades (M1) is scoped to the three apt security pockets and
+          STRUCTURALLY cannot cover any of these. M3 says "read the release notes before every
+          upgrade", which presumes you already know an upgrade exists; AdGuardHome runs with
+          `--no-check-update`. The weekly comparison on /etc/cron.d/dns-health is the only thing
+          between this plan and an unpatched daemon that parses hostile DNS, HTTP/2 and QUIC
+          from the entire internet.
+[ ] The release watch has been SEEN TO FIRE once (pin a version backwards and let it run)              (I4c)
+[ ] The release watch does NOT auto-upgrade -- M3's wrapper stays operator-invoked                     (I4c, M3)
+[ ] Each component's pinned version and release feed are in the Phase O inventory, with a
+    named human responsible for reading it                                                             (I4c, O6)
 [ ] Neither upgrade wrapper contains a setcap step                                                      (M3 trap 1)
 [ ] Every unit is ENABLED, not merely active; the hourly is-enabled guard is in cron                    (M7)
 [ ] No package hold left in force   apt-mark showhold -> empty                                          (M4, M7)
@@ -439,6 +674,37 @@ instrumentation running. Record `RTT_base` first; LT-1 is stated relative to it.
 [ ] Drift cron tests for the PRESENCE of drift, not the absence of it                                      (O4)
 [ ] Handlers are defined once, in restart order, in a single shared handlers file, and
     `reload nftables` calls nft-apply rather than a bare `nft -f`                                          (O3)
+```
+
+**The three procedures that only exist if somebody wrote them.** Each of these is a decision the
+operator must make and record, not a value the plan can supply: every one of them names a human,
+and a procedure with no owner is a paragraph. Read them before go-live, not during the event.
+
+```
+[ ] Compromise procedure exists, names an OWNER, and its first step is NOT a reboot     (08 runbook)
+       -- the availability escalation path's first two steps destroy the evidence: a reboot
+          loses the process table and, under Q3, the whole tmpfs query log; a rollback
+          overwrites the artifacts. It must also state that K3's include list carries
+          /etc/systemd/system, /usr/local/sbin and /etc/cron.d, so restoring a snapshot taken
+          AFTER the intrusion reinstalls it -- restore from before the earliest suspicious
+          timestamp, and rebuild rather than clean.
+[ ] The K5e post-compromise rotation list is written and reachable from that procedure      (K5e)
+[ ] The Q6 Art. 33 clock is understood to start at AWARENESS, and what was exposed is stated
+    per posture -- under the shipped default, up to 6 h of /16-truncated records that were
+    RAM-resident and vanish the moment you reboot                                          (Q6, Q1)
+[ ] IP-change / provider-migration procedure exists and names an OWNER                     (N8, A1)
+       -- rehearse it assuming you CANNOT log into the old box: a suspension normally arrives
+          with the old address already unreachable. The TTL step is the one that cannot be done
+          retroactively, which is why the A/AAAA TTL is held at 300 permanently (L1). Do53
+          clients that configured a literal address cannot be migrated at all -- that is the
+          argument for steering users to the hostname transports in Phase R.
+[ ] Decommissioning procedure exists, names an OWNER, and commits to a notice period that is
+    also stated in the published privacy notice                                        (Q5b, Q6)
+       -- the two prohibitions are the substance: do NOT let the domain lapse (a lapsed name
+          plus a fresh Let's Encrypt certificate is a working hijack of every device still
+          configured to trust it), and do NOT release the IP while Do53 clients still point at
+          it. Certificate revoked at shutdown, restic repository and key destroyed deliberately,
+          disposal date closing RETENTION.md.
 ```
 
 ### L10. Privacy, retention and legal — `(Q)`
@@ -519,6 +785,16 @@ P7c, because the plan as written rate-limits only plain UDP.
 [ ] dns_guard exempts `iifname "wg0"` (or the tunnel subnet is in allowlist4/6, or the chain was
     deliberately removed). **`table inet filter` itself is NEVER deleted -- it is the whole firewall.**   (P7b, P7f)
 [ ] Wildcard cert AND wildcard A record in place -- ONLY if DoT/DoQ ClientID SNI is used                   (P3c, D7)
+[ ] The wildcard AAAA in P3c was published ONLY if the AAAA row of E6 step 9 passes         (P3c, E2a, E6-9)
+       -- P3c exists to serve Android Private DNS and DoQ, i.e. exactly the clients that dial
+          `[v6]:853` first. The shipped wildcard `bind_hosts` already serves both families, so
+          what has to be proven is that this HOST's v6 path works end to end, not that the
+          list contains `'::'`. Adding it binds `[::]:853` twice and proves nothing. Under P6 the
+          listener moves to the two tunnel literals, `10.77.0.1` and `fd77:d15:c0de::1` — one
+          AF_INET socket and one AF_INET6 socket, so P6 is still dual-stack, just unreachable
+          from outside the tunnel. Publish no AAAA for the tunnel address because it is a ULA
+          that is never published, not because the socket cannot serve it. See the L1 posture gate.
+[ ] CAA `issuewild` was relaxed to "letsencrypt.org" BEFORE the DNS-01 wildcard was requested          (D2, D7)
 [ ] Revocation drilled end to end and TIMED     measured: ______ seconds                                   (P8d)
        -- if it is not near-instant, revocation depends on something you do not control
 [ ] P7's honest cost accepted and disclosed: the access layer is a stronger identity layer than
@@ -565,35 +841,60 @@ whole design or produces a silent, unattributable failure in production.
 15. **The published ban duration and the kernel's ban duration disagree.** Q5a and Q5b state a
     number to your users; B5 and J4 implement one. If they diverge, the published policy is false.
     (Q5a, Q5b, B5, J4)
+16. **`dns.example.com` does not resolve to this host from two independent public resolvers, or
+    its zone is served by this machine.** This box is authoritative for nothing, so a zone hosted
+    here disappears the instant the host does — taking every DoT, DoQ and DoH client, both
+    external monitors and the Phase N8 cutover with it, at exactly the moment they are needed.
+    Certbot cannot issue against a name that does not resolve either, and each attempt spends one
+    of five per hour. (D0, A1)
+17. **The build was left half-finished with `adguardhome` running.** From E5 onwards the host
+    answers the public internet on udp/53, tcp/53 and 853 — with Phase B's limits in force but
+    validation unproven, no monitoring, and Phase J's ban escalation absent. Scanner traffic
+    arrives within hours of the first bind. Finish through L, or `systemctl stop adguardhome`
+    before you walk away. (E5)
 
 ---
 
 ## Directory and Port Layout (Final)
 
 This is the authoritative map. Anything listening that is not in the first table, or any file
-outside the second, is either a Phase P/N addition or a defect.
+outside the second, is either a Phase P/N addition or a defect. **Phase R adds neither** — it is
+client-side documentation and introduces no listener, no file, no unit and no cron line on this
+host, which is why it is the one phase with nothing in either table.
 
 ### Listening sockets — base build
 
-| Proto/Port | Bound to | Owner | Exposure | Phase |
-|---|---|---|---|---|
-| tcp/22 | `0.0.0.0` | sshd | **public**, 10 new/min | A4, B5 |
-| udp/53 | `0.0.0.0` | AdGuardHome | **public**, NOTRACK'd, explicit accept (load-bearing) | E2, B5 |
-| tcp/53 | `0.0.0.0` | AdGuardHome | **public**, conntracked, app limiter does NOT cover it | E2, B5 |
-| tcp/80 | `0.0.0.0` | nginx | **public**, permanently: one server block, one webroot `/var/www/acme`, serving the ACME challenge and `/.well-known/`; everything else 404 | E4, D3, Q5c, B7 v2 |
-| tcp/443 | `0.0.0.0` | nginx | **public**: TLS terminator; only `= /dns-query` is proxied | E4 |
-| udp/443 | — | — | **closed**. nginx 1.24.0 has no HTTP/3 and `serve_http3: false` | E2, B5 |
-| tcp/853 | `0.0.0.0` | AdGuardHome `dnsforward` | **public** DoT — nginx is NOT in this path | E2 |
-| udp/853 | `0.0.0.0` | AdGuardHome `dnsforward` | **public** DoQ (RFC 9250), NOTRACK'd | E2, B5 |
-| tcp/3000 | `127.0.0.1` | AdGuardHome | **loopback** — admin UI + `/control/*`, SSH tunnel only | E2, A4 |
-| tcp/8053 | `127.0.0.1` | AdGuardHome | **loopback** — HTTPS DoH backend behind nginx | E2, E4 |
-| udp+tcp/5335 | `127.0.0.1`, `[::1]` | Unbound | **loopback** — the only recursor and validator | C2 |
-| tcp/9090 | `127.0.0.1` | Prometheus | **loopback** | I1 |
-| tcp/9093 | `127.0.0.1` | Alertmanager | **loopback**; 9094 gossip removed via `--cluster.listen-address=` | I8 |
-| tcp/9095 | `127.0.0.1` | alertmanager-ntfy bridge | **loopback** | I8 |
-| tcp/9100 | `127.0.0.1` | node_exporter | **loopback** | I1 |
-| tcp/9115 | `127.0.0.1` | blackbox_exporter | **loopback** | I4 |
-| unix | `/run/unbound.ctl` | Unbound | **local socket**, root-owned; remote control is ON by design | C2, I2 |
+The **Family** column is load-bearing and is the thing most often assumed rather than read — and
+what is assumed is usually that `0.0.0.0` means IPv4. It does not. A wildcard listen address
+resolves to an AF_INET6 socket with `IPV6_V6ONLY=0` (`net/ipsock_posix.go`), so AdGuardHome's
+Do53, DoT and DoQ each serve **both** families from a single socket on the shipped
+`dns.bind_hosts: [0.0.0.0]`. nginx is the opposite shape on purpose: `listen [::]:443` defaults to
+`ipv6only=on`, so E4 ships a `[::]` line beside every `0.0.0.0` line. Phase B's `inet` ruleset
+accepts both families throughout. Two consequences: appending `'::'` to `bind_hosts` binds the
+same socket twice and is never the fix, and the only entry below that is genuinely single-family
+is one bound to a literal address. Whether to publish an AAAA is the L1 posture gate, proven by
+the L5 [off-box] E6 step 9 sweep; whether Unbound *recurses* over IPv6 is `do-ip6` in Phase C — a
+separate question with a separate answer (E2a, C2).
+
+| Proto/Port | Bound to | Family | Owner | Exposure | Phase |
+|---|---|---|---|---|---|
+| tcp/22 | `0.0.0.0` | v4 + v6 as sshd ships — no `ListenAddress` is set | sshd | **public**, 10 new/min | A4, B5 |
+| udp/53 | `0.0.0.0` | **v4 + v6 — one wildcard socket, `v6only:0`** | AdGuardHome | **public**, NOTRACK'd, explicit accept (load-bearing) | E2a, B5 |
+| tcp/53 | `0.0.0.0` | **v4 + v6 — one wildcard socket, `v6only:0`** | AdGuardHome | **public**, conntracked, app limiter does NOT cover it | E2a, B5 |
+| tcp/80 | `0.0.0.0` + `[::]` | v4 + v6 | nginx | **public**, permanently: one server block, one webroot `/var/www/acme`, serving the ACME challenge and `/.well-known/`; everything else 404 | E4, D3, Q5c, B7 v2 |
+| tcp/443 | `0.0.0.0` + `[::]` | v4 + v6 | nginx | **public**: TLS terminator; only `= /dns-query` is proxied | E4 |
+| udp/443 | — | — | — | **closed**. nginx 1.24.0 has no HTTP/3 and `serve_http3: false` | E2, B5 |
+| tcp/853 | `0.0.0.0` | **v4 + v6 — one wildcard socket, `v6only:0`** | AdGuardHome `dnsforward` | **public** DoT — nginx is NOT in this path | E2a |
+| udp/853 | `0.0.0.0` | **v4 + v6 — one wildcard socket, `v6only:0`** | AdGuardHome `dnsforward` | **public** DoQ (RFC 9250), NOTRACK'd | E2a, B5 |
+| tcp/3000 | `127.0.0.1` | v4 loopback | AdGuardHome | **loopback** — admin UI + `/control/*`, SSH tunnel only | E2, A4 |
+| tcp/8053 | `127.0.0.1` | v4 loopback | AdGuardHome | **loopback** — HTTPS DoH backend behind nginx | E2, E4 |
+| udp+tcp/5335 | `127.0.0.1`, `[::1]` | v4 + v6 loopback | Unbound | **loopback** — the only recursor and validator | C2 |
+| tcp/9090 | `127.0.0.1` | v4 loopback | Prometheus | **loopback** | I1 |
+| tcp/9093 | `127.0.0.1` | v4 loopback | Alertmanager | **loopback**; 9094 gossip removed via `--cluster.listen-address=` | I8 |
+| tcp/9095 | `127.0.0.1` | v4 loopback | alertmanager-ntfy bridge | **loopback** | I8 |
+| tcp/9100 | `127.0.0.1` | v4 loopback | node_exporter | **loopback** | I1 |
+| tcp/9115 | `127.0.0.1` | v4 loopback | blackbox_exporter | **loopback** | I4 |
+| unix | `/run/unbound.ctl` | — | Unbound | **local socket**, root-owned; remote control is ON by design | C2, I2 |
 
 Ports that must NOT appear: **udp/784** (v1's DoQ draft port — RFC 9250 is udp/853 and 784 is gone
 from this design entirely), **tcp/8953** (an unnecessary second `unbound-control` channel — the
@@ -610,6 +911,16 @@ decision-5 topology bug).
 | tcp/853 | `0.0.0.0` | nginx `stream` | Phase P5 mTLS front |
 | tcp/8853 | `127.0.0.1` | AdGuardHome | Phase P5 — AGH's DoT moves to loopback behind nginx |
 | ip proto 112 | private NIC | keepalived VRRP | Phase N3 Tier 3 — neither TCP nor UDP, needs its own accept |
+
+The same address-family rule governs the conditional set, and this is where the literal-address
+exception bites. P3c's `*.dns.example.com` AAAA is correct only if this host's IPv6 stack actually
+works behind the wildcard socket — which E6 step 9 measures and nothing else does; P3c is
+precisely the ClientID-SNI path, whose whole purpose is the DoT and DoQ clients that dial
+`[v6]:853` first. Phase P6 is a different case: rebinding AdGuardHome to the two tunnel literals
+`10.77.0.1` and `fd77:d15:c0de::1` gives one AF_INET socket and one AF_INET6 socket, so a P6
+deployment is still dual-stack at the listener — it is simply unreachable from outside the tunnel.
+No AAAA belongs on the tunnel address because `fd77:d15:c0de::1` is a ULA that is never published,
+not because the socket cannot serve it.
 
 ### nftables objects — the single ruleset
 
@@ -712,6 +1023,12 @@ Deleted by this plan and expected absent: `/etc/smartdns`, `/var/lib/smartdns`, 
 | A logging-policy choice pages the operator as though it were an outage | Phase I owns the degradation: `agh_up` stays 1, `agh_metrics_unavailable_by_policy` is the distinct signal, window metrics are **absent rather than zero**, and `AdGuardHomeDown` cannot fire on that path | I0, I3, I6, Q1 | **I11-4b** |
 | AdGuardHome cannot bind :53/:853 and never starts — `NoNewPrivileges=yes` nullifies file capabilities across `execve` | `AmbientCapabilities` + matching `CapabilityBoundingSet`; stale file capability actively cleared; **no phase, including Phase M, ever runs `setcap` to grant** | E5a/E5b, M3 trap 1, O3, decision 8 | E6-1 `getpcaps`, `getcap` empty, H12 |
 | Trust anchor corrupted, stale across a KSK roll, or restored from an old snapshot → **every signed zone SERVFAILs**, presenting as a total outage with no cause | Detect-and-heal guard keyed on the symptom (no AD flag), never a refresh timer racing unbound's own RFC 5011 writer; `root.key` in the backup set | C3, K3 | C3 fault injection, `blackbox-dnssec`/`-fail`, H5 |
+| The anchor is intact today and dead on a published date: `test -s root.key` and an AD flag on `. DNSKEY` both pass for the **entire** RFC 5011 hold-down while the incoming KSK sits in ADDPEND, so a host mid-rollover scores green and is thirty days from total SERVFAIL | Read the key **states**, not the file size; alert when no key is at state 2 or the file has not been rewritten in 90 days; keep `dns-root-data` current so the heal path has a valid ICANN bundle; put ICANN's announced rollover dates in the same calendar as the K6/K7 drills | C3, M1, O6 | **L3 anchor-state block**, monthly line on `/etc/cron.d/dns-health` |
+| A skewed clock SERVFAILs every signed zone, and after C5.8 the host resolves its NTP pool through its own validator — so the clock cannot be fixed by the path that needs it fixed, and the symptom is indistinguishable from a dead trust anchor | IP-literal chrony sources plus `makestep`, so the deadlock cannot form; `ClockUnsynchronised`/`ClockOffsetHigh` as **distinct** alerts next to `DNSSECValidationBroken`; chrony in dns-smoke.sh's `UNITS`; a console `date -s` recovery row in the runbook | A2, I6, H12, 08 runbook | L1 `chronyc sources -v`, the L7 deliberate-skew rehearsal |
+| Any of roughly ninety public CAs may issue for the one name that is the entire authentication of every DoT, DoQ and DoH client — and no client will honour a revocation, because Let's Encrypt shut its OCSP responders down | **CAA** pinning issuance to the CA in use, with `issuewild ";"` unless Phase P needs the wildcard and `iodef` pointing at the Q5c mailbox. CT detects mis-issuance after the fact; CAA is the control that prevents it | D2, D8 | L4 CAA block, `dig +short CAA example.com` |
+| The domain registration and the third-party zone that serves `dns.example.com` are the only dependency in this design with no owner and no monitor. Lapse fails every encrypted transport **closed**, and after redemption anyone may re-register the name, obtain a valid certificate and receive the queries of every device still trusting it | RDAP expiry check weekly at 60 and 30 days; registrar auto-renew, lock and MFA with the card's own expiry recorded; CAA as the re-registration backstop; a probe that resolves the name against a **public** resolver, since every I4 probe targets 127.0.0.1 and cannot see a zone failure | D0, I4, I6, O6 | L4 domain block, `DomainExpiringSoon`/`Critical`, N7 zone-down row |
+| unattended-upgrades is scoped to the apt security pockets and structurally cannot reach the six out-of-apt binaries — AdGuardHome above all, the one process that parses hostile DNS, HTTP/2 and QUIC from the whole internet — so they are patched only when a human happens to look at GitHub | Weekly release watch on `/etc/cron.d/dns-health` comparing each pinned version against upstream and calling `notify.sh`; versions and feeds live in the Phase O inventory with a named reader; the check never auto-upgrades, because M3's operator-invoked wrapper is the only upgrade path | I4c, M1, O6 | L9 release-watch lines, one forced firing |
+| The availability escalation path's first two steps — reboot, roll back — destroy the process table, the tmpfs query log and the upgrade artifacts, so the first response to a suspected intrusion is also the end of the investigation | A separate compromise branch that contains before it preserves, snapshots the volume before anything touches the disk, always rebuilds rather than cleans, and restores from a snapshot dated **before** the earliest suspicious timestamp — K3 backs up `/etc/systemd/system`, `/usr/local/sbin` and `/etc/cron.d`, so a later snapshot reinstalls the intrusion | 08 runbook, K5e, K3, Q6 | L9 procedure gate with a named owner |
 | Certificate renews on disk but the running process keeps the old one — every DoT/DoQ/DoH client fails hard at expiry, with no other symptom | Deploy hook copies + reloads, reaching the binary through the `current` symlink; served-vs-on-disk fingerprint comparison on **both** terminators | D4, H12 cert block | H12, I6 `CertExpiringSoon`/`Critical` |
 | Monitoring dies with the host: kernel panic, OOM, provider termination, null-route — a hard-down resolver produces zero pages | Always-firing Watchdog routed to an **external** dead man's switch, plus a second, independent external port monitor | I6, I8, I9 | **I11-14** (the only proof that counts) |
 | Alerts and event notifications drift into per-phase `curl` calls nobody maintains | One entry point, `notify.sh`, defined by Phase I and called by D, G, H, K, L, M, N and Q; one cron file, `/etc/cron.d/dns-health`, created by Phase I and appended to by the rest | I8b, I10 | I11-15/16, L7 cron inventory |
@@ -773,4 +1090,4 @@ Deleted by this plan and expected absent: `/etc/smartdns`, `/var/lib/smartdns`, 
 
 ---
 
-[Plan index](../dns-server-plan.md) · [Previous: Privacy, Retention and Compliance (optional)](./10-privacy-and-compliance.md)
+[Plan index](../dns-server-plan.md) · [Previous: Privacy, Retention and Compliance (optional)](./10-privacy-and-compliance.md) · [Next: Client Configuration](./12-client-setup.md)

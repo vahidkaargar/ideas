@@ -907,6 +907,7 @@ systemctl enable --now wg-quick@wg0
 Address    = 10.77.0.11/32, fd77:d15:c0de::11/128
 PrivateKey = <CONTENTS OF /etc/wireguard/clients/alice.key>
 DNS        = 10.77.0.1, fd77:d15:c0de::1
+MTU        = 1280
 
 [Peer]
 PublicKey           = <CONTENTS OF /etc/wireguard/server.pub>
@@ -921,6 +922,8 @@ qrencode -t ansiutf8 < /etc/wireguard/clients/alice.conf   # scan in the WireGua
 ```
 
 Split tunnel: the client's `AllowedIPs` covers only the DNS subnet, so ordinary traffic is untouched and the battery cost is negligible. `PersistentKeepalive = 25` keeps the NAT binding alive on cellular.
+
+**`MTU = 1280` is not optional, and it is the one line whose absence is hardest to diagnose.** `wg-quick` defaults to 1420, which assumes a 1500-byte outer path. On PPPoE (1492), on LTE and 5G with GTP encapsulation, inside an outer IPv6 transition tunnel, or behind hotel CPE, the encapsulated packet exceeds the real path MTU and delivery then depends on an ICMP or ICMPv6 "packet too big" reaching the client — which mobile carriers and consumer CPE drop as a matter of routine. The result is that small answers work and large ones silently hang: the handshake completes, `wg show` reports a recent handshake, and P8c's `dig +short` probes all pass because they ask for A records, while DNSSEC-signed answers, TXT records and anything that would fall back to TCP time out. P6c serves plaintext Do53 inside the tunnel and Phase H7 records that AdGuardHome honours the client's advertised EDNS buffer verbatim with no ceiling, so answers above 1400 bytes are ordinary rather than exotic. 1280 is the IPv6 minimum link MTU and therefore survives every path in existence; it costs nothing here, because P6a runs no NAT and enables no forwarding, so the tunnel carries DNS only and there is no throughput to lose. Phase R9 in [Client Configuration](./12-client-setup.md#r9-wireguard-clients-set-the-mtu) carries the same line for the client-side hand-out — keep the two in sync.
 
 **Key management.** The flow above generates client private keys on the server, which is convenient and means the server briefly holds every client secret. If you would rather it never did: generate the keypair *on the device* (the WireGuard app can do this), and paste only the resulting public key into `wg0.conf`. Either way `/etc/wireguard` is 0700, and note that Phase K's restic include list covers it deliberately — the server key and the peer list are exactly what a rebuild needs, and the repository is encrypted. Client *private* keys are the part that need not be there: once a device has its config, delete `/etc/wireguard/clients/<name>.key` from the server and keep only the public key and the PSK. Never render the QR into a screenshot that leaves the machine — it is the private key.
 
@@ -987,7 +990,7 @@ Delete `udp dport 53 counter accept`, `tcp dport 53 counter accept`, `tcp dport 
 
 - **Unspoofable.** UDP source addresses are forgeable; a WireGuard session is not. An allowlist entry is a claim; a WireGuard peer is a proof.
 - **Effectively zero attack surface.** WireGuard's handshake is silent to unauthenticated packets — the port does not respond to scans, so there is nothing to fingerprint, no TLS stack exposed, no DoQ amplification vector and no certificate-transparency breadcrumb.
-- **Roaming for free.** Peer identity is the key, not the address. The same device works on home Wi-Fi, cellular and hotel NAT with no reconfiguration.
+- **Roaming for free, once the network lets you out.** Peer identity is the key, not the address, so the same device works on home Wi-Fi, cellular and hotel NAT with no reconfiguration. The claim is about identity, not reachability: a captive portal blocks udp/51820 and hijacks the lookup of `Endpoint = dns.example.com` until the user has logged in, so the tunnel cannot come up at all and the device is dark until then — P6 is the *worst* of the transports on that network, not the best. R10 in [Client Configuration](./12-client-setup.md#r10-captive-portals-and-hostile-networks) has the failure shapes and what to tell the user; the same caveat applies to P0's "Works on cellular and hotel NAT".
 - **Real revocation.** Delete the `[Peer]` block and `systemctl reload wg-quick@wg0` — the unit's `ExecReload` runs `wg syncconf`, which removes peers absent from the file. That device is off instantly, with no certificate reissue and no TTL wait.
 - **The abuse problem disappears.** There is no open resolver to abuse, so Phase J's ban machinery has nothing left to act on — see P7e, and note that the `dns_guard` chain stays in Phase B's ruleset unless you deliberately remove it.
 
@@ -1242,6 +1245,16 @@ kdig @dns.example.com +tls +tls-hostname=dns.example.com \
 # P6 WireGuard, from a connected peer
 dig @10.77.0.1 example.com A +short
 dig @10.77.0.1 dnssec-failed.org A; echo "exit=$?"   # expect SERVFAIL: Unbound is validating
+
+# P6 MTU. The probes above are all small A records and pass with a wrong MTU,
+# so they prove nothing about P6b's `MTU = 1280`. Ask for an answer that is
+# actually large, over UDP and then over TCP:
+dig @10.77.0.1 +dnssec +bufsize=4096 . DNSKEY +noall +stats | grep 'MSG SIZE'
+dig @10.77.0.1 +tcp +dnssec        . DNSKEY +noall +stats | grep 'MSG SIZE'
+# expect: BOTH return, ~1139 bytes (Phase H7's measured root DNSKEY size).
+# UDP timing out while TCP succeeds is the MTU signature exactly — add
+# `MTU = 1280` to the client [Interface] block (P6b) and retest.
+ip link show wg0 | grep -o 'mtu [0-9]*'   # on the client: expect mtu 1280
 ```
 
 #### P8d. Attribution and revocation drill

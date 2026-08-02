@@ -10,8 +10,10 @@
   - [K3. What is backed up, and what deliberately is not](#k3-what-is-backed-up-and-what-deliberately-is-not)
   - [K4. Backup service and timer](#k4-backup-service-and-timer)
   - [K5. Secrets: what never enters source control, and where it actually lives](#k5-secrets-what-never-enters-source-control-and-where-it-actually-lives)
+  - [K5e. Rotation: routine and post-compromise](#k5e-rotation-routine-and-post-compromise)
   - [K6. Restore drill, Tier 1 — scheduled integrity drill (runs on the live node)](#k6-restore-drill-tier-1-scheduled-integrity-drill-runs-on-the-live-node)
   - [K7. Restore drill, Tier 2 — full DR rebuild (runs on a scratch VPS)](#k7-restore-drill-tier-2-full-dr-rebuild-runs-on-a-scratch-vps)
+  - [K8. Second operator, and what happens when you are unavailable](#k8-second-operator-and-what-happens-when-you-are-unavailable)
 - [PHASE M: Patching and Upgrades](#phase-m-patching-and-upgrades)
   - [M1. unattended-upgrades, with the restart window under control](#m1-unattended-upgrades-with-the-restart-window-under-control)
   - [M2. needrestart: stop it from prompting, and know what it will bounce](#m2-needrestart-stop-it-from-prompting-and-know-what-it-will-bounce)
@@ -28,17 +30,22 @@
   - [N5. Resource ceilings and the OOM killer](#n5-resource-ceilings-and-the-oom-killer)
   - [N6. Scale up or scale out](#n6-scale-up-or-scale-out)
   - [N7. Failure modes](#n7-failure-modes)
+  - [N8. When the address has to change](#n8-when-the-address-has-to-change)
 - [PHASE O: Provisioning and Reproducibility](#phase-o-provisioning-and-reproducibility)
   - [O1. cloud-init: bare VPS to reachable-and-firewalled on first boot](#o1-cloud-init-bare-vps-to-reachable-and-firewalled-on-first-boot)
   - [O2. Ansible layout, and where the role boundaries fall](#o2-ansible-layout-and-where-the-role-boundaries-fall)
   - [O3. The handful of tasks that are actually subtle](#o3-the-handful-of-tasks-that-are-actually-subtle)
   - [O4. Drift detection](#o4-drift-detection)
   - [O5. Rebuild-time target](#o5-rebuild-time-target)
+  - [O6. The operational inventory](#o6-the-operational-inventory)
 - [Operations Runbook](#operations-runbook)
+  - [First: give yourself DNS](#first-give-yourself-dns)
   - [Restart order](#restart-order)
   - [The gate after every change](#the-gate-after-every-change)
   - [Failure scenarios](#failure-scenarios)
   - [Escalation path](#escalation-path)
+  - [If you believe the host is compromised](#if-you-believe-the-host-is-compromised)
+- [Decommissioning](#decommissioning)
 
 ---
 
@@ -308,7 +315,7 @@ fork and CI cache. Treat any secret that was ever committed as disclosed and rot
 | Provider API token for floating-IP moves | Vault, delivered via `LoadCredential=` (K5c) |
 | Phase P access tokens / WireGuard private keys (`/etc/wireguard/*`) | Generated on the node, never templated from the repo; see Phase P |
 
-**a) Correct ownership on the live files.** AdGuardHome rewrites its own configuration at runtime,
+**K5a) Correct ownership on the live files.** AdGuardHome rewrites its own configuration at runtime,
 so the config file must be owned and writable by the service user — a root-owned 0644 file is
 wrong in both directions. And since v0.107.53 AdGuardHome actively tightens permissions on files it
 touches (CVE-2024-36586 hardening), so anything left root-owned inside its tree becomes a startup
@@ -332,7 +339,7 @@ In the Phase D deploy hook, the directory must be created as:
 install -d -o adguardhome -g adguardhome -m 0700 "$DST"
 ```
 
-**b) Template the secret out of the repo.** The Ansible template holds a reference, never a value:
+**K5b) Template the secret out of the repo.** The Ansible template holds a reference, never a value:
 
 ```yaml
 # roles/adguardhome/templates/AdGuardHome.yaml.j2  (excerpt)
@@ -373,7 +380,7 @@ cloudflare.ini
 /etc-backup/
 ```
 
-**c) Runtime secrets reach processes via systemd credentials, not environment files in the unit.**
+**K5c) Runtime secrets reach processes via systemd credentials, not environment files in the unit.**
 `LoadCredential=` requires systemd >= 247; Ubuntu 24.04 ships systemd 255.
 
 ```ini
@@ -386,7 +393,7 @@ The consuming script reads `"$CREDENTIALS_DIRECTORY/provider"`. The credential t
 unit's user, so the script that reads it must run as root — see N3, where keepalived's `notify_master`
 is declared with an explicit `root root`.
 
-**d) A pre-commit tripwire**, because policy that depends on remembering does not hold:
+**K5d) A pre-commit tripwire**, because policy that depends on remembering does not hold:
 
 ```bash
 cat > /srv/dns-infra/.git/hooks/pre-commit << 'EOF'
@@ -420,6 +427,143 @@ ansible-vault view group_vars/dns/vault.yml --vault-id prod@prompt >/dev/null &&
 
 systemd-run -p LoadCredential=provider:/etc/keepalived/provider.token --wait --pipe \
   /bin/sh -c 'test -s "$CREDENTIALS_DIRECTORY/provider" && echo cred-ok'
+```
+
+### K5e. Rotation: routine and post-compromise
+
+K5 says "treat any secret that was ever committed as disclosed and rotate it" and stops there. That
+is reactive, it covers exactly one disclosure route, and it never says *how*. The only scheduled
+rotation anywhere in this plan is Phase P4's 90-day DoH token cadence. Everything else — the
+AdGuardHome admin password, the restic repository password, the object-storage keys, the WireGuard
+server key, `auth_pass`, the provider API token, the ntfy topic, the SSH admin key — is set once at
+build time and never thought about again.
+
+Two of these have a trap that makes an unplanned rotation actively worse than no rotation, so read
+the table's Notes column before you change anything.
+
+| Secret | Lives in | Routine cadence | Rotate with | If disclosed |
+|---|---|---|---|---|
+| AdGuardHome admin password | `vault.yml` (bcrypt) **and plaintext in `/etc/prometheus/agh-credentials`** | 12 months, or on staff change | Two-step below — never the admin UI alone | Full control of filtering, upstreams and TLS config; the attacker can repoint your users at their own resolver |
+| restic repository password | `/etc/restic/repo.pass` + password manager | Do not rotate on a clock; rotate on holder change | `restic key add` then `restic key remove` (K8) | Every backup is decryptable, including `/etc/letsencrypt` |
+| Object-storage keys | `/etc/restic/dns.env`, from `vault.yml` | 12 months | New application key at the provider, re-template, re-run the backup unit | Attacker can read the (encrypted) repo and, if you granted delete, destroy your recovery path |
+| ntfy topic | `/etc/alertmanager/ntfy.env` | 12 months | Below — the topic **is** the credential (Phase I8) | Attacker reads every alert and can publish convincing fake ones |
+| healthchecks.io ping UUID | `/etc/cron.d/dns-health` line (Phase I9) | On account change only | New check at healthchecks.io, replace the URL, re-prove per I11-14 | Attacker can ping your dead man's switch and keep it green through a real outage |
+| WireGuard server key | `/etc/wireguard/*` (generated on the node) | Not on a clock | `wg genkey` + re-enrol every peer (Phase P6) | Every peer tunnel is impersonable; re-enrolment is manual and per-device |
+| keepalived `auth_pass` | `/etc/keepalived/keepalived.conf`, from `vault.yml` | 12 months | Change on **both** nodes in the same playbook run, then restart the standby first | VRRP takeover of the VIP from anywhere on the same L2 |
+| Provider API token | `vault.yml`, delivered via `LoadCredential=` (K5c) | 6 months | Reissue at the provider, scoped to floating-IP moves only | Attacker moves your address, or deletes the instance |
+| Certbot DNS-01 token | `/etc/letsencrypt/secrets/*.ini`, from `vault.yml` | 6 months | Reissue scoped to DNS-edit on one zone | Attacker issues certificates for your name — this is the one that survives losing the box |
+| SSH admin key | `authorized_keys` (Phase A4) | On device change | Add the new key, prove it in a second session, then remove the old (A4's procedure) | Root on the node |
+| Phase P DoH tokens / client CA | `/etc/nginx/doh-tokens.map` | **90 days** (already specified in P4) | Add alongside, migrate, delete, reload twice | One device's access; per-device revocation is the point of the tier |
+
+**The AdGuardHome password is stored twice, and rotating it in the UI breaks Phase I.** Phase I3
+writes the *plaintext* password into `/etc/prometheus/agh-credentials` because the `/control/stats`
+collector has to authenticate. Change the password in the admin UI and nothing warns you: the
+collector starts getting 401s, `agh_up` drops to 0, and `AdGuardHomeDown` pages you for what was a
+password change. Rotation is therefore two steps in one session, and it is not finished after the
+first:
+
+```bash
+# 1. the service's own copy. Generate and PRINT the password first -- Phase E3 explains why
+#    piping $(openssl rand ...) straight into htpasswd leaves you a hash you cannot log in with.
+NEW=$(head -c 24 /dev/urandom | base64); echo "$NEW"
+htpasswd -bnBC 12 "" "$NEW" | tr -d ':\n'; echo   # -> bcrypt hash; put it in vault.yml
+#    re-render AdGuardHome.yaml from the template (Phase O), then:
+systemctl restart adguardhome
+
+# 2. the collector's copy -- SAME SESSION, not "later"
+printf 'admin:%s\n' "$NEW" > /etc/prometheus/agh-credentials
+chmod 0600 /etc/prometheus/agh-credentials; chown root:root /etc/prometheus/agh-credentials
+systemctl restart prometheus
+unset NEW
+```
+
+**Verify:** `/usr/local/sbin/dns-health` passes, and the collector is authenticating again —
+
+```bash
+# the admin/control listener is 127.0.0.1:3000 (Phase E http.address), NOT the :8053 DoH backend
+curl -su "$(cat /etc/prometheus/agh-credentials)" -o /dev/null -w '%{http_code}\n' \
+  http://127.0.0.1:3000/control/stats/config          # -> 200, never 401
+
+sleep 90
+curl -sG http://127.0.0.1:9090/api/v1/query --data-urlencode 'query=agh_up' | jq -r '.data.result[].value[1]'
+#   -> 1.  A 0 here means step 2 was skipped or the two password strings differ.
+```
+
+**Rotating the ntfy topic touches a device you cannot reach from the node.** The topic lives in
+`/etc/alertmanager/ntfy.env`, and it also lives in the subscription list of the ntfy app on your
+phone. Change one without the other and every page goes to a topic nobody is listening to — which
+looks exactly like "no alerts fired", the failure mode Phase I exists to eliminate.
+
+```bash
+NEWTOPIC="dns1-alerts-$(head -c 24 /dev/urandom | base64 | tr -d '+/=' | head -c 32)"
+# subscribe the phone to $NEWTOPIC FIRST, and confirm the subscription is live, then:
+sed -i "s#^NTFY_URL=.*#NTFY_URL=https://ntfy.sh/${NEWTOPIC}#" /etc/alertmanager/ntfy.env
+systemctl restart alertmanager-ntfy
+/usr/local/sbin/notify.sh info "ntfy topic rotated" "confirm this arrived, then unsubscribe the old topic"
+```
+
+Then re-run the Phase I11-14 proof end to end before you unsubscribe the old topic. Unsubscribing
+first is how you discover a typo with no path to tell you about it.
+
+#### Post-compromise: the blast-radius list
+
+Everything above was readable by root. On a host you believe was compromised (see the runbook
+section "If you believe the host is compromised"), the question is not *which* secrets to rotate —
+it is all of them — but in what order, and which ones need more than a new value.
+
+Rotate, in this order, **after** the evidence-preservation steps and **from the rebuilt host or
+your workstation, never from the suspect box**:
+
+1. **The TLS private key, with a real revocation.** D6's guidance is "reissue and redeploy quickly",
+   which is right for an expiry scare and wrong here: a key the attacker holds lets them impersonate
+   `dns.example.com` to every DoT/DoQ/DoH client you have until the certificate expires. Revocation
+   for `keyCompromise` is not optional.
+   ```bash
+   certbot revoke --cert-name dns.example.com --reason keycompromise --no-delete-after-revoke
+   certbot certonly --cert-name dns.example.com --key-type ecdsa --elliptic-curve secp256r1 --force-renewal
+   ```
+   `--reason` is lowercase (`keycompromise`), and `certbot revoke` deletes the lineage afterwards
+   unless you pass `--no-delete-after-revoke` — keeping it means the renewal config and the deploy
+   hook survive. Certbot generates a fresh keypair on each issuance unless `--reuse-key` is set;
+   Phase D does not set it, so confirm rather than assume: the new `privkey.pem` must have a
+   different modulus/public point from the revoked one.
+2. **The restic repository password and the object-storage keys.** The attacker held
+   `/etc/restic/repo.pass` and `/etc/restic/dns.env`, so they could read the repository *and*
+   `restic forget --prune` it. Rotate the object-storage key at the provider first — that cuts
+   access — then add a new repository password and remove the old one (K8). Before you trust any
+   snapshot as a rebuild source, audit what happened to the repository during the intrusion window:
+   ```bash
+   restic snapshots --json | jq -r '.[] | "\(.time)  \(.id[0:8])  \(.hostname)  \(.tags|join(","))"'
+   #   -> every snapshot in the window must be one your timer took. An unexpected snapshot is
+   #      an attacker's; a MISSING one is worse, because it means they pruned.
+   ```
+3. **The ntfy topic and the healthchecks.io check.** Both were readable, and both are how you find
+   out about the next incident. An attacker who keeps your dead man's switch green owns your
+   detection.
+4. **The SSH admin key**, then the provider API token and the provider console password. The console
+   is outside this plan's control and is the one path that survives a rebuild.
+5. **keepalived `auth_pass`** on both nodes, before the rebuilt node rejoins the VRRP group.
+6. **The WireGuard server key and every peer** (Phase P6), and **the Phase P client CA and every
+   token in `doh-tokens.map`**. These are the slowest items on the list because each one ends at a
+   human with a phone. Start them early and expect them to run for days.
+
+Two things that are *not* on the list and are asked for anyway: the AdGuardHome bcrypt hash is worth
+rotating but is not urgent (it was a hash, and the plaintext copy in `agh-credentials` is the actual
+exposure — rotate for that reason, per the two-step above); and the DNSSEC trust anchor is not a
+secret and does not rotate — it is public data, and Phase C's `unbound-anchor` path re-establishes it.
+
+**Verify** (run once a year, and after any rotation, so a half-done rotation is visible):
+
+```bash
+# every stored copy of the AGH password agrees with the running service
+grep -c '^admin:' /etc/prometheus/agh-credentials                     # -> 1
+curl -su "$(cat /etc/prometheus/agh-credentials)" -o /dev/null -w '%{http_code}\n' \
+  http://127.0.0.1:3000/control/stats/config                          # -> 200, never 401
+
+# every credential in the O6 inventory carries a rotation date (section 1 only)
+awk '/^## 1\./{s=1;next} /^## 2\./{s=0} s && /^\| *[A-Za-z]/ {n=split($0,f,"|");
+     if (f[5] ~ /TODO/ || f[5] ~ /^ *$/) print "NO ROTATION DATE:" f[2]}' \
+  /opt/dns-config-backup/INVENTORY.md          # -> no output
 ```
 
 ### K6. Restore drill, Tier 1 — scheduled integrity drill (runs on the live node)
@@ -584,6 +728,126 @@ Do it on a throwaway VPS. Budget under an hour of wall clock including provision
 Write the measured wall-clock number into the runbook. That number is your real RTO. Any RTO you
 did not measure this way is a guess.
 
+### K8. Second operator, and what happens when you are unavailable
+
+Read K7's pass criterion again: *"no step required a value that was not in the password manager"*.
+That drill certifies something nobody states out loud — **nobody without your password manager can
+rebuild this service.** Three single points converge on one human and no section of this plan names
+the convergence:
+
+- K2 puts the restic repository password in your personal vault and says, correctly, that there is
+  no escrow and no recovery path. Phase L repeats it as a go-live gate.
+- Alertmanager has exactly one human receiver: one ntfy topic on one phone (Phase I8). Phase I9's
+  dead man's switch is deliberately routed to a *different topic on the same phone*, which protects
+  against one channel failing and not at all against the phone being in a drawer.
+- SSH is publickey-only with one admin key (Phase A4).
+
+So: two weeks of leave with notifications muted, or one bus, and every page goes nowhere, the
+backups are undecryptable by anyone, and nobody can log in. Every drill in this plan was written for
+one person and passes for one person, which is exactly why this is invisible until it happens.
+
+**This is a decision, not a fact.** A single-operator hobby resolver serving your own household can
+rationally accept the risk — the cost of being wrong is that you reconfigure four devices. A
+resolver other people depend on cannot. The recommended default for anything with users outside your
+household is **one named second holder**, not a team and not a rota; the point is that the number is
+greater than zero, not that it is large.
+
+**a) Key escrow that is not a second copy of your own password.** restic supports multiple
+independent keys for one repository. Give the second holder their own, so that removing their access
+later is one command and does not force you to re-key:
+
+```bash
+set -a; . /etc/restic/dns.env; set +a
+restic key list                          # note the current key ID; yours is marked with *
+# they generate their own password and hand you a file; you never learn its value
+restic key add --new-password-file /run/their-password --user "<their-name>"
+rm -f /run/their-password                # /run is tmpfs, so this never reached the disk;
+                                         # do not stage it in /root or /tmp (Q5a: never write it)
+restic key list                          # -> two keys, theirs tagged with their username
+# to revoke later, from either holder's session:
+#   restic key remove <their-key-id>
+```
+
+Do **not** reach for `restic key passwd` when a second holder exists — it changes the password on
+the key you are currently using and tells you nothing about the other one. And state the part people
+miss: the repository password alone is useless. The second holder also needs the contents of
+`/etc/restic/dns.env` (the object-storage credentials), or they can decrypt a repository they cannot
+reach.
+
+**b) The accounts, not just the secrets.** Every account in the O6 inventory — registrar, hosting
+provider, object storage, healthchecks.io, ntfy, the ACME account — needs a stated answer to "who
+else can get into this". A shared vault entry, a provider-native second user where one exists
+(hosting providers and registrars usually support this; ntfy.sh on the public instance does not),
+or a sealed envelope with a recovery code. O6's second-holder column exists to make the blanks
+visible; a blank there is the finding.
+
+**c) A second alerting destination on a different device.** Add a receiver to Phase I8's
+Alertmanager routing that reaches a different human, and add a second notification integration to
+the healthchecks.io check. I8 already defines two receivers — `ntfy` and `heartbeat` — so the one
+you add here is the **third**, and counting receivers is only evidence of it once you count to three.
+Then re-run the Phase I11-14 dead-man's-switch proof **against the second recipient's device** — an
+untested second receiver is a comment, not a control.
+
+**d) A second SSH admin key**, added and proven with Phase A4's own two-session procedure: open the
+new session before closing the old one, every time.
+
+**e) Before any absence long enough that you would not see a page — a weekend, a flight, leave:**
+
+```bash
+/usr/local/sbin/dns-health                                 # exit 0
+systemctl start restic-backup.service && restic snapshots --last 1   # a snapshot dated today
+ls /var/run/reboot-required 2>/dev/null && echo "PENDING REBOOT - do it before you leave"  # (M6)
+unattended-upgrade --dry-run 2>&1 | tail -3                 # nothing queued and waiting
+git -C /opt/dns-config-backup status --porcelain            # -> empty; nothing uncommitted
+```
+
+Then tell the covering person, in writing, **which failures they are expected to handle and which
+they are not**. The honest division for one covering person who does not operate this stack daily:
+
+| They handle | They do not |
+|---|---|
+| Runbook restart order, and the smoke gate | Anything requiring an Ansible run or a vault passphrase |
+| N7's table rows with a one-command action | A rebuild (K7) — that is a multi-hour drill they have not rehearsed |
+| Escalation steps 1-4 | Escalation step 5 |
+| Escalation step 6 — hand traffic to a public resolver — **explicitly pre-authorised** | Deciding whether the privacy trade-off in step 6 is acceptable; you decided that in advance by pre-authorising it |
+
+Pre-authorising step 6 is the single highest-value line in this section. It converts "the operator is
+unreachable and the service is down indefinitely" into "the service is degraded to a public
+resolver for a week", and it is the only outcome a covering person can reach without your vault.
+
+**f) Onboarding, one page.** Give the second operator the runbook, the smoke gate, and the one-way
+traps, which are the things that are obvious to you and invisible to them:
+
+- Never `nft -f` directly — `/usr/local/sbin/nft-apply` only. A bare load flushes every active ban
+  and hands banned sources their access back mid-incident (Phase B).
+- Never edit AdGuardHome configuration in the admin UI. It rewrites the file, Ansible overwrites it
+  back, and the diff is lost (O3).
+- Never restart AdGuardHome "as well, to be safe" after restarting Unbound. That is a second,
+  unnecessary outage (N4b).
+- Never change the AdGuardHome admin password without the second step in K5e.
+- Never write a fallback `nameserver` line into `/etc/resolv.conf` and leave it — see the runbook's
+  first section.
+
+**Verify:**
+
+```bash
+set -a; . /etc/restic/dns.env; set +a
+restic key list                                            # -> two keys, one marked with *
+
+# no account in the O6 inventory is missing a second holder
+awk '/^## 1\./{s=1;next} /^## 2\./{s=0} s && /^\| *[A-Za-z]/ {split($0,f,"|");
+     if (f[6] ~ /TODO/ || f[6] ~ /^ *$/) print "NO SECOND HOLDER:" f[2]}' \
+  /opt/dns-config-backup/INVENTORY.md                      # -> no output
+
+# Phase I8 already ships TWO receivers -- `ntfy` and `heartbeat` -- so a test for "more than
+# one" passes on an untouched build and proves nothing. Two is the baseline; the second
+# holder's receiver is the third.
+n=$(grep -c '^  - name:' /etc/alertmanager/alertmanager.yml); echo "receivers=$n"
+[ "$n" -ge 3 ] && echo second-receiver-present   # -> >= 3, never 2
+
+ssh-keygen -lf /home/deploy/.ssh/authorized_keys | wc -l   # -> 2
+```
+
 ---
 
 ## PHASE M: Patching and Upgrades
@@ -639,6 +903,48 @@ is a comforting no-op that makes the next reader believe a protection exists. `u
 *are* apt packages and *will* be restarted by their maintainer scripts during a security upgrade —
 that is intentional and correct, and M2 controls how.
 
+**The one package this policy freezes and must not freeze: `dns-root-data`.** Phase C1 installs it
+for `/usr/share/dns/root.hints` (Unbound's `root-hints:`, C2) and `/usr/share/dns/root.key` (which
+is 24.04's `unbound-anchor` default path, C3). It has **never been published to a `-security`
+pocket**: in noble the archive holds `2023112702~willsync1` in the release pocket and
+`2024071801~ubuntu0.24.04.1` in `noble-updates`, and nothing else. With the origins list above, a
+host built from the noble base image sits on the January-2024 root hints permanently, and nothing in
+this plan ever looks at the file's age. Root-server addresses do change; priming usually rescues you,
+which is precisely why nobody notices until the day it does not, and the anchor material ages beside
+it.
+
+The obvious fix does not work: `Allowed-Origins` is a list of *origins*, not of packages, and
+unattended-upgrades has no per-origin package filter — `Package-Whitelist` narrows what is allowed,
+it cannot widen an origin for one package. Adding `${distro_codename}-updates` would admit every
+non-security update on the box, which is the policy this section deliberately rejects. So take the
+package out of unattended-upgrades' hands entirely and upgrade it on its own schedule, appending to
+the one cron file (created by Phase I):
+
+```bash
+cat >> /etc/cron.d/dns-health << 'EOF'
+# dns-root-data ships only from -updates, never -security, so unattended-upgrades
+# (M1) can never touch it. Monthly explicit upgrade + a staleness alarm. Unbound is
+# NOT restarted here: root.hints is read at startup, and a stale-hints box is not an
+# outage -- a surprise 04:40 restart is. The next planned restart picks it up.
+40 4 1 * * root apt-get update -qq && out=$(apt-get install -y --only-upgrade dns-root-data 2>&1); if echo "$out" | grep -q '^Setting up dns-root-data'; then /usr/local/sbin/notify.sh info "dns-root-data upgraded" "now $(dpkg-query -W -f='${Version}' dns-root-data) - restart unbound at the next maintenance window to load the new root hints"; fi
+50 4 1 * * root find /usr/share/dns/root.hints -mtime +400 -print -quit | grep -q . && /usr/local/sbin/notify.sh warning "root.hints is stale" "dns-root-data has not been updated in over 400 days - check that the monthly upgrade job above is actually running"
+EOF
+```
+
+**No `%` anywhere in those two lines, deliberately.** cron translates an unescaped `%` into a
+newline, so the obvious `find -printf '%TY-%Tm-%Td'` staleness check — and an equally obvious
+`printf '%s' "$out"` — truncate the command at the first `%` and silently never run. That is why
+`echo` appears above where `printf` would normally be preferred. If you extend these lines, escape
+every percent as `\%`.
+
+400 days rather than 365: the package is republished irregularly (the noble update above landed
+roughly seven months after release), so a one-year threshold produces a false alarm most years and
+teaches you to ignore it.
+
+Phase C3's `unbound-anchor-guard.sh` is the consumer that suffers most from a frozen copy — it
+passes `-r /usr/share/dns/root.hints` when it re-bootstraps, so stale hints degrade the one path
+that is supposed to recover you. Hardening that guard against looping is Phase C's job, not M1's.
+
 **Verify:**
 
 ```bash
@@ -646,6 +952,15 @@ apt-config dump | grep -i 'Unattended-Upgrade::Allowed-Origins'
 #   -> exactly the three security origins above, nothing inherited from 50unattended-upgrades
 unattended-upgrade --dry-run --debug 2>&1 | tail -20
 systemctl list-timers apt-daily-upgrade.timer --no-pager
+
+# the dns-root-data exception
+apt-cache policy dns-root-data
+#   -> the installed version matches the -updates candidate, not the release-pocket one
+stat -c '%y %n' /usr/share/dns/root.hints
+grep -c 'dns-root-data' /etc/cron.d/dns-health          # -> 2 (upgrade job + staleness alarm)
+dpkg -L dns-root-data | grep '^/usr/share/dns/'
+#   -> root.ds, root.hints, root.hints.sig, root.key. If your unbound-anchor invocation
+#      references any other file from this package, confirm it against this list first.
 ```
 
 ### M2. needrestart: stop it from prompting, and know what it will bounce
@@ -1208,7 +1523,7 @@ restarts AdGuardHome underneath the operator, who then restarts it again, doubli
 window; (ii) at boot, `Requires=` + `After=` means an Unbound that fails to activate prevents
 AdGuardHome from starting at all — so a resolver config typo takes out the public listener too.
 
-**a) Give the units a restart policy that survives a transient fault.** These keys go into the
+**N4a) Give the units a restart policy that survives a transient fault.** These keys go into the
 canonical unit drop-in — `/etc/systemd/system/<unit>.service.d/hardening.conf`, the same single
 drop-in file that carries Phase C's Unbound hardening and Phase A6's memory ceilings. There is one
 drop-in per unit in this design and it is assembled by the Ansible template (Phase O), not by a
@@ -1246,7 +1561,7 @@ It is deliberately **not** unlimited. A daemon that is genuinely broken — bad 
 corrupt binary — hits ten failures in fifty seconds and is parked in `failed`, which is the correct
 outcome: an infinite restart loop against a config typo burns CPU, floods the journal, and hides the
 fault behind a unit that always reports "activating". The backstop only works if somebody is told,
-which is what (c) is for. Clear a parked unit with `systemctl reset-failed <unit>` after fixing the
+which is what N4c is for. Clear a parked unit with `systemctl reset-failed <unit>` after fixing the
 cause.
 
 Exponential backoff (`RestartSteps=` / `RestartMaxDelaySec=`, systemd v254+, present on Ubuntu
@@ -1254,7 +1569,7 @@ Exponential backoff (`RestartSteps=` / `RestartMaxDelaySec=`, systemd v254+, pre
 ten-in-five-minutes ceiling already bounds the spin, and a second mechanism doing the same job with
 different numbers is how the two phases drifted apart in the first place.
 
-**b) Loosen the dependencies so a restart upstream does not bounce the public listener.** In
+**N4b) Loosen the dependencies so a restart upstream does not bounce the public listener.** In
 `/etc/systemd/system/adguardhome.service`, replace `Requires=unbound.service` with:
 
 ```ini
@@ -1275,8 +1590,8 @@ AdGuardHome come up and serve from its own cache even when Unbound is failing to
 `BindsTo=` anywhere in this stack: it is the directive that would turn one daemon's crash into a
 full-stack outage.
 
-**c) Make failure visible, and do not rely on `OnFailure=` alone.** With the canonical limits in (a)
-a unit *can* reach the terminal `failed` state, so `OnFailure=` is live and worth wiring. It is not
+**N4c) Make failure visible, and do not rely on `OnFailure=` alone.** With the canonical limits in
+N4a a unit *can* reach the terminal `failed` state, so `OnFailure=` is live and worth wiring. It is not
 sufficient. The dangerous case is the daemon that restarts nine times every five minutes forever: it
 never trips the limit, never reaches `failed`, never fires `OnFailure=`, and reports `active` to
 every naive check while dropping queries continuously. Alert on restart churn as well:
@@ -1348,7 +1663,7 @@ images ship with **zero swap**, so when resident memory passes the limit the ker
 picks a victim by heuristic — and the largest RSS on this box is the resolver. The OOM killer takes
 out DNS, `Restart=always` restarts it into the same memory pressure, and you have a loop.
 
-**a) The ceilings and the swap file belong to Phase A6. This phase sets neither.** Memory and swap
+**N5a) The ceilings and the swap file belong to Phase A6. This phase sets neither.** Memory and swap
 have exactly one owner in this document, and it is not High Availability. **Phase A6** provides the
 swap file, `vm.swappiness` (in Phase A's `/etc/sysctl.d/99-dns.conf` — the only sysctl file in this
 design that may carry that key), and the `MemoryHigh=` / `MemoryMax=` / `OOMScoreAdjust=` keys for
@@ -1361,7 +1676,7 @@ Do not restate the numbers here, do not create a second swap file, and do not wr
 ends up with whichever one sorts last, and the failure is invisible until the day the OOM killer
 runs.
 
-**b) Why those ceilings exist, which is this phase's actual contribution.** A cgroup ceiling
+**N5b) Why those ceilings exist, which is this phase's actual contribution.** A cgroup ceiling
 converts an unbounded, box-wide failure into a bounded, single-service one: with `MemoryMax=` the
 resolver's cgroup is what dies, not an arbitrary victim chosen by the kernel's heuristic, and
 `MemoryHigh=` throttles and reclaims before it gets that far. The negative `OOMScoreAdjust=` on both
@@ -1374,7 +1689,7 @@ gives `MemoryHigh=` time to reclaim instead of the kernel killing something imme
 so it is never used for routine paging, because swapping a resolver destroys p99 latency; that is
 what the low `vm.swappiness` is for.
 
-**c) Size the cache from measurement, not from a round number.** Unbound's resident set runs
+**N5c) Size the cache from measurement, not from a round number.** Unbound's resident set runs
 materially above the configured `msg-cache-size` + `rrset-cache-size` (allocator overhead plus
 per-thread structures); budget roughly double and then measure. Phase A6's ceilings are a starting
 point that must be reconciled with the actual cache sizes set in Phase C:
@@ -1441,6 +1756,7 @@ self-inflicted query load; see Phase C. Any runbook row you find referencing `dn
 | All lookups time out from everywhere | Host down, or VIP not attached to any node | Check provider console; `hcloud floating-ip describe dns-vip`; on Tier 3 check `journalctl -u keepalived` on both nodes | External probe fails; node stops reporting |
 | All lookups time out, host is up and SSH works | nftables ruleset reloaded without the UDP/53 accept for NOTRACK'd traffic (Phase B) — `ct state established,related accept` does not cover untracked packets | `nft list ruleset \| grep -A5 notrack`; restore the known-good `/etc/nftables.conf` from restic (Phase K) and apply it with `/usr/local/sbin/nft-apply` (Phase B), never a bare `nft -f` | Smoke gate: `AGH udp/53 public` FAIL, loopback OK |
 | Everything resolves except DNSSEC-signed names (SERVFAIL) | Trust anchor missing, stale, or wrong ownership after an Unbound upgrade (M4); or clock skew | `test -s /var/lib/unbound/root.key`; `stat -c '%U %a' /var/lib/unbound/root.key`; `timedatectl`; then `unbound-anchor -a /var/lib/unbound/root.key && systemctl restart unbound` | AD-bit / SERVFAIL probe in Phase I |
+| **Every** name SERVFAILs, signed and unsigned alike; `chronyc tracking` shows `Reference ID : 00000000` and `Leap status : Not synchronised`; SSH by IP still works | Clock skew, **not** a trust-anchor fault. DNSSEC signatures carry inception and expiration times, so a skewed clock fails every signature at once — and after C5.8 this host resolves its own NTP pool names through its own validator, so the clock cannot be fixed by the path that needs it fixed (A2) | `timedatectl` **first** — more than a few minutes out and it is this, so do not spend the row above's `unbound-anchor` and cache dump on it. Then run A2's console-recovery procedure ("Recovering a host that is already deadlocked") from the out-of-band console or an SSH session opened by IP: `systemctl stop chrony`; `date -u -s '<UTC now>'`; `systemctl start chrony`; `chronyc makestep`; `chronyc tracking`; then `systemctl restart unbound adguardhome` to clear the validation failures cached while the clock was wrong | `ClockUnsynchronised` and `ClockOffsetHigh` (Phase I6), deliberately distinct alerts from `DNSSECValidationBroken`; `chrony` is also in `dns-smoke.sh`'s `UNITS` list (H12) |
 | Plain DNS fine, DoH broken, DoT/DoQ fine | nginx down or bad config — DoH is the only path through nginx (canonical decision 5) | `nginx -t && systemctl reload nginx` | Smoke gate: `DoH :443` FAIL alone |
 | DoH broken and the admin login page is reachable from the internet | AdGuardHome HTTPS listener bound publicly instead of `127.0.0.1:8053` — its HTTPS listener inherits the host from `http.address` (Phase E) | Fix `http.address`/`port_https` per Phase E, restart AGH, then re-check `curl https://<PUBIP>/` | Smoke gate: `admin UI not public` FAIL |
 | All TLS transports fail simultaneously after a renewal | Certificate renewed on disk but not reloaded into AdGuardHome, or `conf/ssl` is root-owned 0700 (K5a) | `stat -c '%U:%G %a' /opt/adguardhome/conf/ssl`; run the Phase D deploy hook; restart AGH | Smoke gate: served-cert fingerprint ≠ on-disk fingerprint |
@@ -1451,7 +1767,74 @@ self-inflicted query load; see Phase C. Any runbook row you find referencing `dn
 | `/opt` or `/var` filling | Query log growth (retention is Phase Q) or accumulated release directories (M3) | Check `du -sh /var/log/adguardhome/querylog /var/lib/adguardhome/stats`; prune `releases/` | Disk guard in Phase I |
 | One client floods the resolver | Abuse (Phase J). **Do not look in the query log for the source** — `anonymize_client_ip: true` masks IPv4 to /16 and IPv6 to /48 on disk, so any ban derived from it targets a masked, wrong address | Use the kernel-side nftables counters from Phase J; ban with `nft add element inet filter banned_ips { <IP> timeout 10m }` — 10 minutes on first offence, escalating to 24 hours on repeat, per Phase J | nftables counter rates, Phase I |
 | Failover happened but clients still hang | Expected. See N1 — glibc waits out its 5 s timeout per query against a black-holed address | Nothing to fix on the server; if it recurs, shorten client `options timeout:1 attempts:1` where you control the clients | External probe recovers while user reports persist |
+| One user on a mobile carrier, conference WLAN or IPv6-only network reports "most sites fail" with no DNS error, while `dig` from everywhere else is clean | Their access network is IPv6-only behind NAT64 and its own resolver was doing DNS64. **This resolver does no DNS64 and deliberately never will** (R11): Unbound answers truthfully, so AAAA synthesis stops and RFC 7050 prefix discovery — which reads the prefix out of a synthesised `ipv4only.arpa` AAAA — stops with it. Nothing on this host is broken | Confirm from the affected device with R11's discriminator, using the network's own resolver, not the one under test: `dig @"$NETNS" ipv4only.arpa AAAA +short` returns addresses (typically in `64:ff9b::/96`) while `dig @<PUBLIC_IP> ipv4only.arpa AAAA` returns NOERROR with no answer. Tell them to keep the network-provided resolver on that network, or to reach this one through the Phase P6 WireGuard tunnel, which carries IPv4 inside. **Do not enable `module-config: "dns64 ..."` on this resolver** — synthesising AAAA into a translator you do not operate black-holes every dual-stack client on the internet (R11) | Invisible to every monitor here, and correctly so: the server is healthy and its answers are right. It arrives as a user report and nothing else |
 | Both nodes rebooted at once | Unattended reboot windows not staggered (M6) | Stagger `Automatic-Reboot-Time` by ≥ 1 hour | Both nodes silent simultaneously |
+| `apt`, `certbot` and `restic` all fail to resolve while you are fixing something else | `/etc/resolv.conf` points at `127.0.0.1:53`, which is **AdGuardHome** — the thing that is down (C5.8) | Re-flip `resolv.conf` to a public resolver for the duration, restore it before you close the incident — see the runbook's first section | Not visible to any monitor. This is a self-inflicted diagnostic dead end, and the errors name the tool, never the cause |
+
+### N8. When the address has to change
+
+The risk register calls provider AUP suspension for running an open resolver *more likely to end
+this service than any regulator*, and Phase Q says suspension — not a warning — is the normal
+enforcement once your IP appears in a reflection report. Both stop at "read the terms before
+launch". The response to a suspension is a different provider and therefore a different address,
+and Phase A1's warning that the IP is published in DNS, in client configuration and in a
+Certificate Transparency log is the entire blast radius stated once and never returned to.
+
+Read the uncomfortable half first, because it changes what you do on day one. **Every Do53 user
+typed the address into a router or an OS setting by hand.** There is no mechanism to update them,
+no failover, and no notification channel that reaches them. A forced IP change is a permanent
+outage for that population regardless of how well you execute everything below. That is the
+argument for steering users to `dns.example.com` over DoT/DoQ/DoH rather than to a literal address,
+and it is an argument you can only act on before the incident.
+
+**The one step you cannot do retroactively.** Lower the TTL on the `A`/`AAAA` records for
+`dns.example.com` *before* you need to. Once the box is null-routed, a 3600-second TTL is 3600
+seconds of outage you have already committed to and cannot shorten. The standing recommendation is
+to keep that record at **300 seconds permanently** — the query volume on one hostname is
+irrelevant, and the flexibility is the whole point.
+
+```bash
+dig +noall +answer dns.example.com A | awk '{print $2}'     # -> 300, today, not on the day
+```
+
+**Rehearse the order assuming you cannot log into the old box**, because a suspension usually
+arrives with the address already unreachable. Nothing below requires the old host except the two
+steps that say so.
+
+1. **Provision and build the new node** from Phase O cloud-init plus the playbook, and restore
+   `/etc/letsencrypt` from restic (K7 steps 3-6). The certificate is for the *name*, not the
+   address, so it migrates unchanged — this is why K3 backs the whole lineage up.
+2. **Set the PTR at the new provider** before cutover. Phase Q4 explains why: matching forward and
+   reverse is what makes an abuse desk route a complaint to you instead of null-routing the address,
+   and you are about to be a new IP with no reputation.
+3. **Cut over the `A`/`AAAA` records.** With a 300 s TTL, encrypted clients follow within five
+   minutes; Do53 clients never follow.
+4. **Keep the old address answering for as long as the old provider allows.** If the suspension left
+   you any window at all, run both in parallel. This is the only mitigation the Do53 population gets.
+5. **The things that do not follow the `A` record** — this is the list nobody assembles at 2am:
+   - **Phase P WireGuard peer configs** with a literal `Endpoint =` rather than the hostname. If any
+     client has one, that client is dead until you re-issue its config.
+   - **Phase B's `allowlist4`/`allowlist6` and Phase P's access controls**, which are written from
+     the *clients'* side and unaffected by your address change — but any upstream ACL that named your
+     old address (a corporate firewall, a partner's allowlist) is now wrong.
+   - **The blackbox probe targets** in Phase I, and the external monitors: the healthchecks.io check
+     and the ntfy topic survive, but any probe pointed at a literal address does not.
+   - **`security.txt` and the published privacy notice** (Phase Q5), if either names the address.
+   - **The provider abuse-forwarding arrangement.** Phase Q6 tells you to record its reference; that
+     reference is provider-specific and does not migrate. Open a new one.
+   - **The Ansible inventory and the cloud-init file**, and the O6 inventory's provider rows.
+6. **Re-run the go-live gate**, not just the smoke gate. Phase L exists because a new address on the
+   internet is a new exposure surface: re-check that the admin UI is not public and that nothing but
+   :53, :443, :853 and :80 answers.
+
+**Verify:**
+
+```bash
+/usr/local/sbin/dns-smoke.sh                                          # SMOKE: PASS on the new node
+dig +short -x <NEW-IP>                                                # -> dns.example.com.
+grep -rl '<OLD-IP>' /srv/dns-infra /etc/wireguard /etc/prometheus \
+  /var/www/acme/.well-known /opt/dns-config-backup 2>/dev/null        # -> no output
+```
 
 ---
 
@@ -1762,11 +2145,123 @@ ansible-playbook -i inventory/prod.yml site.yml --limit dns1     # repair
 ssh deploy@dns-dr 'cloud-init status --long; sudo nft list ruleset | head; systemctl is-active nftables ssh chrony'
 ```
 
+### O6. The operational inventory
+
+Three other sections of this plan tell you to write something "in the Phase O inventory", and until
+now that artifact did not exist. Phase I4 sends the resolved `blackbox_exporter` version there
+because the install is deliberately unpinned. Phase I9 sends the external monitoring services there
+— *"an external dependency nobody documented is an external dependency that silently lapses"*. Phase
+L gates go-live on it. `inventory/prod.yml` is not that thing: it is an Ansible host list containing
+`dns1` and `dns2`, and an operator who follows the instruction literally writes an external-service
+register into a YAML file of hostnames.
+
+The file lives at `/opt/dns-config-backup/INVENTORY.md` — the same directory Phase A3 creates and
+git-initialises, the same one Phase Q writes `RETENTION.md` into, and already inside Phase K3's
+restic include list. It gets committed like everything else there, so changes are dated and
+attributable locally as well as recoverable off-host.
+
+**Never put a credential value in this file.** Every row names *where the secret lives*, never what
+it is. The directory is 0750 root-owned and the restic repository is encrypted, but this file is the
+one someone will paste into a ticket.
+
+```bash
+cat > /opt/dns-config-backup/INVENTORY.md << 'EOF'
+# Operational inventory - dns.example.com
+# Every row needs an answer and a date. "not applicable" with a reason is an answer;
+# TODO is not. The verify in Phase O6 fails on any remaining TODO.
+
+## 1. Accounts and who can reach them
+| Account | Identifier | Credential lives in | Last rotated | Second holder (K8) |
+|---|---|---|---|---|
+| Registrar | | | TODO | TODO |
+| Hosting provider | | | TODO | TODO |
+| Object storage (restic) | | | TODO | TODO |
+| healthchecks.io | | | TODO | TODO |
+| ntfy | | | TODO | TODO |
+| ACME / Let's Encrypt account | | /etc/letsencrypt/accounts | n/a - key, not password | TODO |
+
+## 2. External dependencies and what happens when they lapse
+| Dependency | Notifies | Expires / renews | Consequence of lapse |
+|---|---|---|---|
+| Domain registration | | TODO | Service name hijackable - see Decommissioning |
+| healthchecks.io check UUID | | n/a | Dead man's switch stops paging (I9) |
+| ntfy topic | | n/a | All alerts silent (I8) |
+| Provider abuse-forwarding ticket ref | | TODO | Complaints go to a null-routed address (Q6) |
+| security.txt Expires: field | | TODO | Signals an abandoned service (Q5c) |
+
+## 3. Versions of everything not installed from apt
+| Component | Version | Pinned? | Source |
+|---|---|---|---|
+| AdGuardHome | | yes (M3) | GitHub release |
+| restic | | yes (K1) | GitHub release, SHA256-verified |
+| blackbox_exporter | | NO - resolved at install (I4) | GitHub release |
+| dnslookup | | NO - resolved at install (I4) | GitHub release |
+| prometheus / alertmanager | | | apt or upstream - state which |
+
+## 4. Measured numbers (not estimates)
+| Measurement | Value | Date measured | Where it came from |
+|---|---|---|---|
+| Rebuild wall clock (real RTO) | | TODO | K7 steps 2-9, target in O5 |
+| Phase P token revocation time | | TODO | P8d |
+| Load-test knee (qps) | | TODO | Phase H |
+| Query-log tmpfs peak usage | | TODO | df -h after a week at real traffic (Q3) |
+EOF
+chmod 0640 /opt/dns-config-backup/INVENTORY.md
+git -C /opt/dns-config-backup add INVENTORY.md
+git -C /opt/dns-config-backup commit -qm 'O6: operational inventory'
+```
+
+Section 3 doubles as the input to any release-watching you do: a version you never wrote down is a
+version you cannot compare against upstream.
+
+**Verify** — the same shape as Phase Q6's register check, because the failure mode is the same
+(a file that exists and answers nothing passes a `test -f`):
+
+```bash
+grep -c 'TODO' /opt/dns-config-backup/INVENTORY.md      # -> 0
+git -C /opt/dns-config-backup log -1 --format='%ci %an' -- INVENTORY.md
+#   -> a date you recognise. An inventory last touched at build time is a stale inventory.
+
+# the unpinned components actually have their resolved versions recorded (I4)
+grep -A6 '^| Component' /opt/dns-config-backup/INVENTORY.md | grep -E 'blackbox_exporter|dnslookup'
+#   -> both rows carry a version string
+```
+
 ---
 
 ## Operations Runbook
 
 The 3am page. Everything here is a pointer or a command, not an explanation.
+
+### First: give yourself DNS
+
+**This host has no working DNS while AdGuardHome is down.** Phase C5.8 set
+`/etc/resolv.conf` to `nameserver 127.0.0.1`, and `resolv.conf` has no syntax for a port, so that
+means 127.0.0.1:**53** — AdGuardHome, not Unbound on 5335. That is the correct posture for a
+resolver appliance and it is a deliberate choice, but it means `apt`, `certbot renew`, the Phase D
+deploy hook, `restic` (which must resolve your object-storage endpoint) and `ansible` all fail
+during exactly the incident you are trying to fix, with errors that name the tool and never the
+cause. Escalation step 2 reaches for restic. Step 5 reaches for restic. Neither works until you do
+this.
+
+```bash
+grep nameserver /etc/resolv.conf
+#   -> 'nameserver 127.0.0.1' AND AdGuardHome not answering = this host resolves nothing
+
+printf 'nameserver 9.9.9.9\nnameserver 1.1.1.1\n' > /etc/resolv.conf     # while you work
+```
+
+**Restoring it is mandatory, and it is part of closing the incident, not optional tidying:**
+
+```bash
+printf 'nameserver 127.0.0.1\noptions edns0 trust-ad\n' > /etc/resolv.conf
+grep -c '^nameserver' /etc/resolv.conf      # -> 1, exactly. Not 2.
+```
+
+A forgotten fallback line is precisely the silent, unvalidated resolution path C5.8 exists to
+remove, and no Phase I alert will ever tell you it is there. If you would rather not re-flip this
+file under pressure at all, pin your object-storage endpoint in `/etc/hosts` as a standing measure —
+that keeps restic working regardless, which covers the two escalation steps that need it.
 
 ### Restart order
 
@@ -1839,6 +2334,13 @@ runbook table that is wrong. The four you will actually hit, in order:
 
 ### Escalation path
 
+**Before step 0: if you have any reason to think this is an intrusion rather than a fault, stop and
+go to "If you believe the host is compromised" below.** Steps 1, 2 and 5 destroy the evidence you
+would need, and step 5 re-imports the attacker's persistence from your own backup.
+
+0. **Give yourself DNS.** See the first section of this runbook. If you skip this, steps 2 and 5
+   fail on name resolution and you will spend twenty minutes debugging restic.
+
 1. **Run the smoke gate.** It tells you which layer is broken and stops you restarting the wrong
    one. Everything below assumes you have its output.
 2. **Roll back the last change.** If anything was upgraded or edited in the last 24 hours, undo that
@@ -1852,6 +2354,10 @@ runbook table that is wrong. The four you will actually hit, in order:
    go to step 5.
 5. **Rebuild.** Phase K7 steps 3-8 against a fresh host. You have a measured RTO (O5); if you are
    past it, say so rather than continuing to debug.
+   If the rebuild has to land on a **different address** — provider suspension, provider gone, IP
+   reassigned — you are in **N8**, not here. It is a different and longer procedure, its first step
+   (lowering the record's TTL) is the one you cannot do retroactively, and a population of your
+   users cannot be migrated at all.
 6. **Last resort: hand traffic away.** Repoint `dns.example.com` at a public resolver you trust and
    accept the TTL, or tell users to switch. This ends the outage for them at the cost of the privacy
    properties this service exists to provide (Phase Q) — it is a deliberate decision with a
@@ -1859,6 +2365,220 @@ runbook table that is wrong. The four you will actually hit, in order:
    soon as the smoke gate passes on your own node.
 7. **Write it up.** Any incident that reached step 4 gets an entry: what failed, which monitor saw it
    (or did not — that is the more valuable finding), and what changed so it cannot recur silently.
+
+### If you believe the host is compromised
+
+This is a different procedure from the one above, and the difference is not stylistic: **the
+escalation path's first instinct destroys the evidence and its last step re-installs the
+compromise.** Step 2 rolls back — overwriting the artifacts. Step 5 rebuilds from restic, and Phase
+K3's include list carries `/etc/systemd/system`, `/usr/local/sbin`, `/etc/cron.d` and
+`/opt/dns-config-backup`, which is exactly where persistence lives. Restore a snapshot taken after
+the intrusion and you get the attacker back, with a passing smoke gate to reassure you.
+
+Triggers worth acting on: a service you did not enable, an outbound connection you cannot account
+for, a file under `/usr/local/sbin` you did not write, an nftables ruleset that does not match
+`/etc/nftables.conf`, an SSH login you did not make, a restic snapshot nobody's timer took, or a
+provider abuse notice describing traffic you cannot explain. Suspicion is enough. The cost of
+running this procedure on a false alarm is an afternoon; the cost of skipping it on a real one is
+that you never find out how they got in and it happens again.
+
+**1. Do not.** Not as a preference — these are the four moves that cost you the investigation:
+
+- **Do not reboot.** The process table, the open sockets, and everything on tmpfs go with it. Phase
+  Q3 puts the query log and the statistics database on tmpfs, so a reboot also destroys the only
+  record of what was exposed — which you need for the notification decision in step 5.
+- **Do not roll back**, and do not run `upgrade-adguardhome.sh` or `upgrade-unbound.sh`. Their
+  rollback paths overwrite the binaries and unit files you need to look at.
+- **Do not run `nft-apply`.** It flushes and reloads the ruleset, taking the live one — including
+  anything the attacker added — with it.
+- **Do not "clean up" anything you find.** Deleting the implant tells them you noticed and tells
+  you nothing.
+
+**2. Contain, without pulling the plug.** Two options, and the trade-off is real:
+
+| | Provider console: detach the network | Scoped nftables policy drop |
+|---|---|---|
+| Stops exfiltration | Immediately and completely | Only what the ruleset covers |
+| Keeps you able to work | No — console only, and you cannot copy evidence off | Yes |
+| Kills your own alerting | Yes | No |
+| Attacker can react | No | Yes — they see the ruleset change |
+
+For a resolver on a VPS, **the scoped drop is usually right**: you need the network to get evidence
+off the box, and detaching it leaves you typing into a console with no way to preserve anything.
+Write a temporary ruleset by hand and load it directly — this is the one place in this plan where
+`nft -f` is correct rather than forbidden, because preserving the live ban timeouts is no longer the
+priority and you must not overwrite the evidence in `/etc/nftables.conf` by editing it:
+
+```bash
+nft list ruleset > /root/EVIDENCE-nft-ruleset.txt        # capture BEFORE you change anything
+cat > /root/containment.nft << 'EOF'
+#!/usr/sbin/nft -f
+flush ruleset
+table inet filter {
+  chain input   { type filter hook input   priority 0; policy drop;
+                  iif lo accept
+                  ip saddr <YOUR-ADMIN-IP> tcp dport 22 accept
+                  ct state established,related accept }
+  chain forward { type filter hook forward priority 0; policy drop; }
+  chain output  { type filter hook output  priority 0; policy drop;
+                  oif lo accept
+                  ct state established,related accept
+                  ip daddr <YOUR-ADMIN-IP> accept
+                  ip daddr <OBJECT-STORAGE-IP> tcp dport 443 accept }
+}
+EOF
+nft -f /root/containment.nft
+```
+
+Note what this does to you: the service is now down for every user, the egress policy drop means
+`notify.sh` cannot reach ntfy, and DNS resolution on this host is gone twice over. Accept all three
+deliberately. Announce the outage through whatever channel Phase Q5 gave you.
+
+**3. Preserve, off-host, in this order.** The provider snapshot first, because everything after it
+runs on the suspect kernel and you should assume its output is a best effort rather than truth:
+
+```bash
+# 3a. FIRST: a provider-side volume snapshot. Console or CLI - not from the box.
+#     hcloud server create-image --type snapshot --description "compromise-$(date -uI)" dns1
+
+# 3b. Then, on the box, into one directory you will copy off:
+D=/root/evidence-$(date -uIs); mkdir -m 0700 -p "$D"
+journalctl -o export > "$D/journal.export"        # persistent journal is Phase Q3's decision paying off
+ps auxwwf                > "$D/ps.txt"
+ss -tulpanH              > "$D/sockets.txt"
+lsof -nP 2>/dev/null     > "$D/lsof.txt"
+nft list ruleset         > "$D/nft.txt"
+systemctl list-units --all --no-pager > "$D/units.txt"
+systemctl list-timers --all --no-pager > "$D/timers.txt"
+crontab -l 2>/dev/null; cat /etc/cron.d/* > "$D/cron.txt" 2>/dev/null
+dpkg --verify            > "$D/dpkg-verify.txt" 2>&1    # any line here is a modified packaged file
+find / -xdev -newer /var/lib/unbound/root.key -type f 2>/dev/null > "$D/newer-than-anchor.txt"
+cp /opt/adguardhome/conf/AdGuardHome.yaml "$D/"   # AGH rewrites this at runtime: it is a change record
+sha256sum "$D"/* > "$D/SHA256SUMS"
+
+# 3c. Copy it OFF. Never leave the only copy on the suspect disk, and never write it into
+#     the restic repository the attacker's credentials could reach.
+#     From your workstation:  scp -r deploy@dns1:/root/evidence-* ./
+```
+
+`find / -newer /var/lib/unbound/root.key` is a cheap, surprisingly effective first pass: that file
+is written by Unbound's RFC 5011 tracking and by nothing else, so it is a reasonable "everything
+after this is suspicious" waterline. It is a heuristic, not proof — an attacker who sets timestamps
+defeats it.
+
+**4. Rebuild. Do not clean.** State it flatly because operators reliably talk themselves out of it:
+**you cannot clean a compromised host.** You do not know what you did not find, verifying absence is
+impossible, and the effort of trying exceeds the 20-minute rebuild target in O5. The only case for
+cleaning is a host you cannot rebuild, which this one is not — Phase O exists precisely so that
+rebuilding is cheaper than trusting.
+
+Rebuild per K7, with two changes:
+
+- **On a new instance with a new address**, not a reimage of the same one. If that means a new IP,
+  you are also in N8.
+- **From a restic snapshot dated before the earliest suspicious timestamp in `newer-than-anchor.txt`
+  and before the earliest suspicious journal entry** — not `latest`. This is the whole reason K4's
+  retention keeps 14 dailies and 12 monthlies.
+  ```bash
+  restic snapshots --json | jq -r '.[] | "\(.time)  \(.id[0:8])"'
+  restic restore <ID-from-before-the-window> --target / --include /etc/letsencrypt
+  ```
+  And restore *only* what you must. `/etc/letsencrypt` is the one thing Ansible cannot regenerate;
+  everything else in K3's include list should come from source control on a rebuild after an
+  intrusion, even if that costs you the Phase B allowlist and you have to re-enter it by hand.
+
+**5. Rotate everything.** Every secret on that box was root-readable. The ordered list, with the
+blast radius of each and the certificate revocation that is mandatory rather than optional, is
+**K5e's post-compromise section**. Two items from it are time-critical and worth repeating here:
+revoke the TLS certificate with `--reason keycompromise` (an attacker holding that key can
+impersonate your resolver to every encrypted client until expiry), and cut the object-storage
+credential before anything else, because that credential could `restic forget --prune` your only
+clean snapshot while you are reading this.
+
+**6. Tell people, and know what you are telling them.** Phase Q6's Art. 33 row puts a 72-hour clock
+on breach notification, and **it starts at awareness, not at confirmation** — the moment you formed
+this suspicion, not the moment you proved it. What was actually exposed is posture-dependent, and
+the honest answer under this plan's shipped default is: up to six hours of query records with
+IPv4 client addresses truncated to /16 and IPv6 to /48, held in RAM. Under Phase Q's Posture A there
+is nothing to disclose because no record existed. Note the ugly interaction with step 1: those
+records are on tmpfs, so a reboot destroys the evidence of what was exposed *and* your ability to
+state what was not — which is a second, independent reason the provider snapshot in 3a comes first.
+
+Record the incident in `RETENTION.md` and `INVENTORY.md` (O6) regardless of whether it met a
+notification threshold. An intrusion nobody wrote down is an intrusion the next operator repeats.
+
+---
+
+## Decommissioning
+
+This plan has a birth and no death, and the two disposal steps an operator would naturally take —
+let the domain lapse, release the IP — are the two that hand an attacker a name or an address that a
+real population of devices still trusts unconditionally.
+
+Shutting this down is **not** symmetric with standing it up. Phase N1 and the risk register
+establish that encrypted DNS clients have no client-side failover: Android Private DNS accepts one
+hostname and **fails closed**. So "stop the service" does not mean degraded resolution for your
+users, it means *no* resolution, on every phone and laptop configured against you, until a human
+reconfigures each device by hand. Phase P makes it worse in the specific way that install-and-forget
+artifacts always do: P3f hands out Apple `.mobileconfig` profiles that users install once and never
+think about, and P6 writes `Endpoint = dns.example.com:51820` and a `DNS =` line into a WireGuard
+config on every phone.
+
+This section lands months or years in, when the operator has moved on — which is exactly when nobody
+is reading the plan. Write the notice period into the published privacy notice (Phase Q5b) **now**,
+while you are still paying attention, so that the commitment outlives your interest in it.
+
+**Wind down in this order. Clients first, disposal second.**
+
+1. **Announce, with a fixed date.** Through every channel that reaches an enrolled user: the
+   `security.txt` `Contact:` address, the published privacy notice page, and — for a Phase P
+   deployment, where you know who holds a profile or a peer config — directly. A resolver whose
+   users you cannot name is a resolver you should not have published; that is a Phase Q decision,
+   and this is where it comes due.
+2. **Keep answering for the whole notice period.** Thirty days is a reasonable default for a small
+   deployment and is not a long time to keep a EUR 6 VPS running. Do not shorten it because traffic
+   dropped — falling traffic means people migrated, not that the remainder can cope.
+3. **Then stop the service.** Not before.
+4. **Revoke the certificate.** The private key is about to sit on a disk you no longer control, on
+   storage a provider will reissue to someone else.
+   ```bash
+   certbot revoke --cert-name dns.example.com --reason cessationofoperation
+   ```
+5. **Do NOT let the domain lapse.** This is the single most damaging thing you can do on the way
+   out. Every device still configured with `dns.example.com` will accept whoever registers it next,
+   and that registrant can obtain a perfectly valid Let's Encrypt certificate for the name — the
+   clients' trust decision is "does the hostname's certificate validate", and it will. Keep the
+   registration, remove the `A`/`AAAA` records, and let the name resolve to nothing. Renewing a
+   domain indefinitely is the cost of having published a resolver on it. If you truly will not keep
+   it, hold it for at least a year past shutdown and accept that you are handing over a hijack after
+   that.
+6. **Do NOT release the IP while Do53 clients still point at it.** You cannot notify that
+   population — they typed an address into a router — and the provider will reassign it eventually
+   regardless. This is not fixable, and it is the strongest argument for a longer notice period
+   rather than a shorter one.
+7. **Dispose of the data, per Phase Q5a.** In the terms Q5a requires — crypto-erase, not a wipe you
+   cannot perform:
+   ```bash
+   # The restic repository holds /etc/letsencrypt and, in a Phase P deployment, identity material.
+   restic key list                              # know every key before you destroy any
+   # Destroy the repository AND every copy of its password, including the second holder's (K8).
+   # Then delete the bucket at the provider - deleting the repo contents alone leaves the bucket.
+   ```
+   Close healthchecks.io and ntfy, cancel the hosting account, and delete the local vault entries
+   last, not first — you will want them during steps 4 through 7.
+8. **Write the closing entry.** `RETENTION.md` gets a dated line recording the shutdown and the data
+   disposal; `INVENTORY.md` (O6) gets the same. That entry is the artifact that answers a question
+   arriving two years later about data you no longer hold.
+
+**Verify:**
+
+```bash
+dig +short dns.example.com A                              # -> empty, with the domain still registered
+whois example.com | grep -i 'expir'                       # -> a date in the future
+curl -sS https://dns.example.com/dns-query -o /dev/null -w '%{http_code}\n' 2>&1 | tail -1
+#   -> connection failure, not a 200 from somebody else's server
+grep -i 'decommission' /opt/dns-config-backup/RETENTION.md   # -> a dated closing entry
+```
 
 ---
 

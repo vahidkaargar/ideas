@@ -25,6 +25,9 @@
   - [H10. Rate limiting under abuse — and no collateral damage](#h10-rate-limiting-under-abuse-and-no-collateral-damage)
   - [H11. Load test](#h11-load-test)
   - [H12. Post-change smoke gate](#h12-post-change-smoke-gate)
+  - [H13. Upstream and root-server outage injection](#h13-upstream-and-root-server-outage-injection)
+  - [H14. Rollback rehearsal — the recovery path nothing else runs](#h14-rollback-rehearsal-the-recovery-path-nothing-else-runs)
+  - [H15. Expired certificate — the failure a renewal dry run cannot find](#h15-expired-certificate-the-failure-a-renewal-dry-run-cannot-find)
 
 ---
 
@@ -262,10 +265,11 @@ df -h /
 
 This is the acceptance suite. Every test states what PASS looks like, and every threshold in H11 has an identifier the Phase L checklist references rather than restates.
 
-Two rules govern the whole phase:
+Three rules govern the whole phase:
 
 - **Encrypted-transport and isolation tests run from a second host**, never from the DNS server. Running them locally bypasses the NIC, the firewall, the conntrack bypass, the rate limiter, and — for DoH specifically — the entire nginx front end, which means they can pass on a box where the public service is completely broken.
 - **A test that cannot fail is worse than no test.** Several v1 checks used vectors that produce the "pass" output on a totally unprotected resolver. Where that was true, the corrected vector and the reason are given inline.
+- **H13, H14 and H15 deliberately break the running service.** They remove upstream reachability, force a version rollback, and install an expired certificate — the three states this plan configures machinery to survive and otherwise never produces. Each carries its restore step, and the restore is part of the test, not an afterthought. Run them one at a time in a maintenance window before go-live, and confirm `dns-smoke.sh` reports `SMOKE: PASS` before starting the next one.
 
 ### H0. Test harness
 
@@ -913,6 +917,302 @@ runuser -u adguardhome -- /opt/adguardhome/current/AdGuardHome --check-config \
 # someone ran the gate without runuser, and the next real start is the one that breaks:
 find /opt/adguardhome/validate ! -user adguardhome -print   # expect: no output
 ```
+
+### H13. Upstream and root-server outage injection
+
+Phase C configures RFC 8767 serve-stale with four keys, argues the design at length, and names its price: during an upstream or authoritative incident a client waits **up to 1.8 seconds per query** before the stale answer is released. Nothing in this plan has ever produced that state. Phase C's own C5.6 gets one step away and stops — it says "warm the name, then break egress, then query" and then supplies a `dig` line that runs against a perfectly healthy resolver, so the documented `; EDE: 3 (Stale Answer)` cannot appear and an operator following it scores a pass on a check that never executed.
+
+This test supplies the injection, the assertions, and the restore. It proves four things that are otherwise only asserted in prose: that the resolver degrades to stale rather than SERVFAIL, that the stale answer survives the timeouts between Unbound and the client, that the monitoring can tell "the internet is broken" from "this node is broken", and that recovery is actually immediate rather than gated on a cache nobody knows about.
+
+**Injection.** Run on the DNS host, in a maintenance window, with a failsafe armed *before* the block goes in.
+
+```bash
+D=whoami.akamai.net
+dig @127.0.0.1 -p 5335 $D A +noall +answer            # warm it - stale can only serve what is cached
+TTL=$(dig @127.0.0.1 -p 5335 $D A +noall +answer | awk '{print $2; exit}')
+echo "cached TTL=$TTL"
+
+# Failsafe first. If this shell dies mid-test the box restores itself in 15 minutes.
+# `nft -f` reloads the canonical ruleset from disk, which also clears the live
+# banned_ips / floodmeter state (Phase J) - acceptable in a pre-go-live drill,
+# not something to trigger casually on a running service.
+systemd-run --on-active=15min --unit=dns-egress-restore /usr/sbin/nft -f /etc/nftables.conf
+
+# The block. Three details are load-bearing:
+#   dport 53 only - replies to clients carry SPORT 53, so this cuts the recursion
+#     leg and leaves the service leg answering. Phase B's own egress RRL rules in
+#     this chain match sport 53, so the two are disjoint.
+#   oifname != lo - keeps AdGuardHome -> Unbound (127.0.0.1:5335) and the host's
+#     own resolver path intact; only off-box recursion is cut.
+#   drop, not reject - an ICMP error lets unbound fail fast, and the 1800 ms
+#     client-response timer would never be exercised. The hang is the point.
+nft insert rule inet filter output oifname != "lo" udp dport 53 counter drop
+nft insert rule inet filter output oifname != "lo" tcp dport 53 counter drop
+nft -a list chain inet filter output | grep 'dport 53 counter drop'   # RECORD the two handles
+
+# Prove the cut is real before scoring anything downstream:
+dig @198.41.0.4 . NS +time=2 +tries=1 +noall +comments   # expect: no servers could be reached
+
+sleep $((TTL + 5))          # the cached entry must actually expire
+```
+
+**At the resolver.**
+
+```bash
+dig @127.0.0.1 -p 5335 $D A +dnssec +time=5 +tries=1 +noall +comments +answer +stats
+unbound-control stats_noreset | grep -E 'num.expired'
+```
+
+PASS, all four together: `status: NOERROR` with an answer rather than SERVFAIL; the comments carry `; EDE: 3 (Stale Answer)`; the answer TTL is **30** (`serve-expired-reply-ttl`, Phase C); `Query time` is roughly **1800 ms**; and `num.expired` is above zero and rising. Write the measured latency down — that is Phase C's stated cost as it lands on *this* host, and it is the number to quote in the runbook when someone reports "the resolver got slow".
+
+Two failures with distinct causes. SERVFAIL instead of an answer means serve-expired never engaged: check the name really was in cache and still inside `serve-expired-ttl: 86400`. A query time near 0 ms *with* EDE 3 means `serve-expired-client-timeout` is 0 rather than 1800 — stale-first, not RFC 8767 — which is precisely the line Phase C calls load-bearing, not in effect.
+
+**At the public edge.** The 1.8-second wait has to survive two timeouts between Unbound and the client, and neither of them is in Phase C. From the H0 test host:
+
+```bash
+dig  @<PUBLIC_IP>            $D A +time=5 +tries=1 +noall +comments +stats
+kdig @dns.example.com +tls   $D A
+kdig @dns.example.com +https $D A
+```
+
+PASS: the same stale answer arrives on every transport, slowly. If any of them SERVFAILs while the resolver itself answered correctly, something between them clipped the wait — there are exactly two candidates:
+
+```bash
+grep -n 'upstream_timeout' /opt/adguardhome/conf/AdGuardHome.yaml   # must exceed 1800ms
+grep -rn 'proxy_read_timeout' /etc/nginx/sites-enabled/              # 10s (Phase E)
+```
+
+Phase E sets no `upstream_timeout`, so AdGuardHome's built-in default applies — read the effective value out of the running config rather than assuming it. Tune that key below ~2 s at any point in the future and every client gets SERVFAIL during an upstream incident even though Unbound answered correctly; the entire serve-stale design is void at the edge and no other test in this suite would notice.
+
+**A name that was never cached.** This is the half users actually report.
+
+```bash
+dig @<PUBLIC_IP> $(openssl rand -hex 4).example.org A +time=8 +tries=1 +noall +comments
+# expect: SERVFAIL. Stale serves only what it already has, so during an upstream
+# outage the shape of the complaint is "sites I visit work, new ones do not".
+```
+
+**What the monitoring said — record it, do not assume it.**
+
+```bash
+/usr/local/sbin/dns-smoke.sh; echo "exit=$?"
+```
+
+Expect this to be counterintuitive: for the first hours of an upstream outage the smoke gate largely **passes**, because serve-stale is doing exactly its job and every name H12 probes is already warm. Two of its lines are worth reading rather than scoring. `bogus zone SERVFAILs` passes during a total outage for the wrong reason — the same fail-open shape H5 warns about. The DoT/DoH/DoQ checks use `+timeout=5`, comfortably above 1.8 s, so they pass slowly instead of failing.
+
+The conclusion to record is that **H12 is not an upstream-outage detector**. Detection belongs to Phase I: note which of `RecursionStalled`, `ServfailRateHigh` and `RecursionLatencyP99High` fired, and how long each took to fire. An outage that fires none of them is a Phase I gap to fix there, not an H13 failure.
+
+On a Tier 3 pair (Phase N), record whether the keepalived health script entered FAULT. A global root or TLD failure is indistinguishable from a node fault when viewed from inside one node, and failing the VIP over hands it to a standby that is equally unable to resolve — an extra failover stacked on an outage it cannot fix. Confirm from a second network before failing anything over.
+
+**Restore — part of the test, not an afterthought.**
+
+```bash
+nft -a list chain inet filter output | grep 'dport 53 counter drop'
+nft delete rule inet filter output handle <handle>      # once per rule, using the handles above
+# If the handles are gone: nft -f /etc/nftables.conf - correct, but it clears the
+# live ban and flood-meter state with it (Phase J).
+systemctl stop dns-egress-restore.timer 2>/dev/null || true
+
+dig @198.41.0.4 . NS +time=2 +tries=1 +noall +comments   # answers again
+
+# Recovery is NOT immediate on its own, and this is the step that makes an operator
+# think the restore failed. Unbound caches per-server unreachability in its
+# infrastructure cache for `infra-host-ttl` (900 s default; Phase C does not override
+# it), so for up to 15 minutes after the block is lifted it keeps behaving as though
+# the authoritatives were still down. Clear it explicitly:
+unbound-control flush_infra all
+
+dig @127.0.0.1 -p 5335 $D A +noall +stats | grep 'Query time'   # back to normal, no EDE 3
+unbound-control stats_noreset | grep num.expired               # stops rising
+nft list tables                                                # EXACTLY: inet raw, inet filter
+/usr/local/sbin/dns-smoke.sh; echo "exit=$?"                   # SMOKE: PASS, exit=0
+```
+
+PASS overall: stale answers were released with EDE 3 at the measured 1.8 s, they reached clients on every transport, an uncached name SERVFAILed, the monitoring signal that fired is written down, and the ruleset plus the resolver are byte-for-byte back where they started.
+
+### H14. Rollback rehearsal — the recovery path nothing else runs
+
+Phase K's doctrine is that an untested backup is not a backup, it is a hope, and this plan holds itself to that nearly everywhere: restore is drilled twice, restart self-heal is drilled with kill tests in Phase N, the trust anchor is fault-injected in Phase C, the ban pipeline is drilled in Phase J, the dead man's switch is drilled in Phase I. Rollback is the exception. Phase M's `upgrade-adguardhome.sh` carries a rollback branch that executes **only** when `dns-smoke.sh` fails, and Phase M's verification runs the forward upgrade — so the first execution of that branch happens at 03:00, with the service already down, inside the script that is supposed to be the recovery.
+
+Rehearse it here on a healthy host and record the wall clock. That number is your rollback RTO and it belongs in the runbook next to the Phase K7 rebuild time.
+
+**AdGuardHome.** No script edit is needed. The branch is gated on the smoke gate's exit status, and `dns-smoke.sh` takes `CERT` from the environment, so pointing it at a path that does not exist fails the gate on the certificate block alone while every other check still runs and passes.
+
+```bash
+# 1. Starting state.
+A=$(readlink -f /opt/adguardhome/current); echo "running: $A"
+
+# 2. Force the branch. <vB> MUST be a different release from A - re-running the
+#    script with the version already installed makes PREV and STAGE the same
+#    directory, and the rollback degenerates into a no-op symlink move that
+#    proves nothing.
+time CERT=/nonexistent/fullchain.pem /usr/local/sbin/upgrade-adguardhome.sh <vB>
+```
+
+Expected: the upgrade itself succeeds, the smoke gate prints `FAIL` on the certificate lines, the script prints `SMOKE FAILED — rolling back to ...`, runs the branch, and exits 1. The second smoke run *inside* the rollback branch also fails, for the same injected reason — that is not a rollback failure, and an operator reading the transcript later needs to know it.
+
+```bash
+readlink -f /opt/adguardhome/current                    # == $A
+cmp -s /opt/adguardhome/conf/AdGuardHome.yaml \
+       /opt/adguardhome/conf/AdGuardHome.yaml.pre-<vB> && echo 'CONFIG RESTORED'
+stat -c '%U:%G %a' /opt/adguardhome/conf/AdGuardHome.yaml   # adguardhome:adguardhome 600
+ss -ulnp | grep ':53 '                                      # the OLD binary is bound again
+/usr/local/sbin/dns-smoke.sh; echo "exit=$?"                # SMOKE: PASS, exit=0 (clean env)
+```
+
+`cmp` is the assertion that carries the proof, not `schema_version`. The schema number only changes when the new release actually migrates, which adjacent patch releases usually do not — so a matching `schema_version` proves nothing in either direction. A byte-identical match against the `.pre-<vB>` copy proves the pre-migration file was restored rather than the migrated one, in every case.
+
+**What the rollback does not restore.** The branch moves the `current` symlink and the config. It does not touch AdGuardHome's runtime state — `stats.db` under `/var/lib/adguardhome/stats`, and anything else the newer binary opened and may have written in its own format. Running an older binary against forward state is an untested combination in AdGuardHome itself, not something this plan can fix; what it can do is tell you where to look when a rolled-back node starts cleanly but its statistics are wrong.
+
+```bash
+journalctl -u adguardhome --since -5m --no-pager | grep -iE 'stats|schema|migrat|error'
+```
+
+**Unbound.** Phase M's apt rollback has a precondition nothing in the plan checks: the previous version must still be *installable*. `apt-get install --allow-downgrades unbound=$PREV` succeeds while `$PREV` sits in a configured pocket or the local cache — true when the previous version is the noble base-pocket one, false when it was itself an `-updates` version that has since been superseded and evicted.
+
+```bash
+apt-cache madison unbound                              # every installable version and its source
+dpkg-query -W -f='${Version}\n' unbound                # what is running now
+ls /var/cache/apt/archives/unbound_*.deb 2>/dev/null   # the local fallback
+```
+
+If `madison` lists exactly one version, **the Phase M Unbound rollback cannot run on this host today** — record that rather than discovering it during an incident. The mitigation is to keep the running `.deb` (`apt-get download unbound`) somewhere the Phase K backup set covers, so a downgrade is possible offline.
+
+When a second version is available, rehearse it:
+
+```bash
+PREV=<the older version from madison>
+time DEBIAN_FRONTEND=noninteractive apt-get install -y --allow-downgrades "unbound=$PREV"
+apt-mark hold unbound
+unbound-checkconf                          # OLD binary, CURRENT drop-in - see below
+systemctl restart unbound; sleep 3
+dig +dnssec @127.0.0.1 -p 5335 internetsociety.org A | grep -c ' ad'      # -> 1
+dig +dnssec @127.0.0.1 -p 5335 dnssec-failed.org  A | grep -c 'SERVFAIL'  # -> 1
+/usr/local/sbin/dns-smoke.sh; echo "exit=$?"
+apt-mark showhold                          # -> unbound
+```
+
+`unbound-checkconf` before the restart is the line that earns its place. A rollback runs an older binary against a drop-in written for the newer one; a directive that exists only in the newer build is accepted by dpkg and rejected at startup, which leaves you with no resolver at all — during a rollback, which is where you already were. The two `dig` lines are the same gate Phase M uses for the forward path, for the same reason: a resolver that starts but no longer validates is the worst outcome of either direction.
+
+Then fix forward and release the hold:
+
+```bash
+DEBIAN_FRONTEND=noninteractive apt-get install -y unbound
+apt-mark unhold unbound
+apt-mark showhold                          # -> empty
+/usr/local/sbin/dns-smoke.sh; echo "exit=$?"
+```
+
+The hold is deliberate and Phase M's standing guard flags it. During a real rollback that flag is **expected**, not an alert to clear — clearing it lets unattended-upgrades reinstall the version you just rolled away from, unattended, at 03:00. Say so in the incident notes at the time.
+
+PASS overall: both rollback branches executed end to end on a healthy host, the config was provably restored from the pre-migration copy, the rolled-back node passes a clean smoke run, and two wall-clock numbers are recorded. Phase M's verification covers the forward path only; this test covers the branch it never runs, and Phase L should not pass without the two measured RTOs written down.
+
+### H15. Expired certificate — the failure a renewal dry run cannot find
+
+Phase D proves renewal *works*: `certbot renew --dry-run` exercises the authenticator, and D5 already records that a dry run skips deploy hooks entirely. What no test in this plan produces is the state all of that machinery exists to prevent — a certificate that is genuinely past its `notAfter` while the service keeps running. It fails differently from a renewal failure, it fails differently per transport, and three checks this document already ships keep returning green while it is happening. That combination is why an operator who has only ever seen a passing dry run misdiagnoses it.
+
+Run it once, before go-live, against **AdGuardHome's copy** of the certificate. Do not stage it in `/etc/letsencrypt/live/` — that tree is the certbot lineage's state machine, and mutating it to manufacture a fake fault is a real risk taken for a pretend one. DoH through nginx fails in the same way for the same reason (the failure is in the client's clock check, not the server's), and nginx reads the lineage directly.
+
+**Build an expired certificate.**
+
+```bash
+# `openssl req -days` accepts a POSITIVE integer only, and -not_after arrived in
+# `openssl req` after the 3.0.x that noble ships. Check before reaching for it:
+openssl req -help 2>&1 | grep -q not_after && echo 'has -not_after' || echo 'use faketime'
+
+apt-get install -y faketime
+install -d -m 0700 /root/expired-cert-drill
+faketime '2024-01-01 00:00:00' openssl req -x509 -nodes \
+  -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+  -days 30 -subj '/CN=dns.example.com' \
+  -addext 'subjectAltName=DNS:dns.example.com' \
+  -keyout /root/expired-cert-drill/privkey.pem \
+  -out    /root/expired-cert-drill/fullchain.pem
+
+openssl x509 -enddate -noout -in /root/expired-cert-drill/fullchain.pem
+# expect a notAfter in early 2024. ECDSA P-256 deliberately, to match Phase D -
+# an RSA test cert changes handshake cost as well as validity, and you would be
+# reading two variables at once.
+```
+
+**Install it, and record which of two things your build does.**
+
+```bash
+cp -a /opt/adguardhome/conf/ssl/fullchain.pem /root/expired-cert-drill/fullchain.real
+cp -a /opt/adguardhome/conf/ssl/privkey.pem   /root/expired-cert-drill/privkey.real
+
+install -o adguardhome -g adguardhome -m 0640 \
+  /root/expired-cert-drill/fullchain.pem /opt/adguardhome/conf/ssl/fullchain.pem
+install -o adguardhome -g adguardhome -m 0640 \
+  /root/expired-cert-drill/privkey.pem   /opt/adguardhome/conf/ssl/privkey.pem
+systemctl restart adguardhome; sleep 5
+
+systemctl is-active adguardhome
+journalctl -u adguardhome --since -2m --no-pager | grep -iE 'certificat|expir|tls'
+```
+
+AdGuardHome v0.107.72 and newer watch these two files and hot-reload TLS (Phase D4), so the swap may take effect without the restart — the explicit restart is here so the *startup* path is exercised too. Which of two branches you land in is the single most valuable output of this test and it is not safe to guess:
+
+- **AdGuardHome starts and serves the expired certificate.** The outage is DoT and DoQ only. Do53 is untouched and the box looks healthy from outside.
+- **AdGuardHome refuses the certificate and does not start.** The outage is total — `:53` goes with it — and the incident is an order of magnitude larger than "TLS expired".
+
+Record which one, with the version that produced it. It sets the severity of every certificate alert Phase I raises, and it is the difference between a partial and a total outage.
+
+**What clients see.** From the H0 test host:
+
+```bash
+dig @<PUBLIC_IP> google.com A +short                # unaffected - Do53 has no certificate
+
+kdig @dns.example.com +tls google.com A             # RECORD: this SUCCEEDS
+kdig @dns.example.com +tls +tls-ca +tls-hostname=dns.example.com google.com A   # FAILS
+kdig @dns.example.com +quic +tls-ca +tls-hostname=dns.example.com google.com A  # FAILS
+
+openssl s_client -connect dns.example.com:853 -servername dns.example.com </dev/null 2>&1 \
+  | grep -E 'Verify return code|notAfter'
+# expect: 'Verify return code: 10 (certificate has expired)'
+```
+
+The finding to write down: **`kdig @host +tls name A` succeeds against an expired certificate**, because kdig performs no verification at all unless `+tls-ca` or a pin is given. Every real client validates and fails closed — Android Private DNS, the Apple encrypted-DNS profiles, `systemd-resolved` with `DNSOverTLS=yes` and a hostname, and browser DoH. A suite that runs only the bare `+tls` form certifies a certificate state that takes the entire encrypted client base offline. H3's second line exists for exactly this and must never be dropped as redundant.
+
+**What the gates see.**
+
+```bash
+/usr/local/sbin/dns-smoke.sh; echo "exit=$?"
+```
+
+Read the signature rather than just scoring it:
+
+- `cert only -N days left` — **FAIL**. This is the check that catches it, and it catches it from the on-disk file, never from the wire.
+- `served cert == on-disk (dns.example.com:853)` — **OK**. Both are the same expired certificate, so the fingerprint comparison passes. That check detects a *stale reload* — renewed on disk, old in memory — and it is structurally incapable of detecting expiry. Do not let a green fingerprint line read as "the certificate is fine".
+- `served cert differs from on-disk (dns.example.com:443)` — FAIL, because nginx is still serving the real lineage. That mismatch is an artifact of this drill's scoping and disappears at restore.
+- `DoT tcp/853` — **OK**, for the same reason the bare `kdig +tls` above passes: the gate's transport checks do not validate the chain.
+
+The rule that follows: in `dns-smoke.sh` the `openssl x509 -enddate` check is the **only** expiry detector, and it reads the file rather than the connection. If anyone ever removes it on the grounds that "the transport checks pass anyway", the gate goes blind to this failure entirely.
+
+Phase I's `CertExpiringSoon` / `CertExpiringCritical` should have fired weeks before any host reaches this state. Use the drill to confirm the exporter reads the path the deploy hook *writes* — `/opt/adguardhome/conf/ssl/fullchain.pem` — and not only the lineage. The two diverge in exactly one scenario, a broken deploy hook, and that is the scenario D5 names: the lineage renews, the alert clears, and the served copy rots until it expires.
+
+**Restore.**
+
+```bash
+install -o adguardhome -g adguardhome -m 0640 \
+  /root/expired-cert-drill/fullchain.real /opt/adguardhome/conf/ssl/fullchain.pem
+install -o adguardhome -g adguardhome -m 0640 \
+  /root/expired-cert-drill/privkey.real   /opt/adguardhome/conf/ssl/privkey.pem
+systemctl restart adguardhome; sleep 5
+
+kdig @dns.example.com +tls +tls-ca +tls-hostname=dns.example.com google.com A +short
+diff <(openssl x509 -noout -fingerprint -sha256 -in /opt/adguardhome/conf/ssl/fullchain.pem) \
+     <(openssl x509 -noout -fingerprint -sha256 -in /etc/letsencrypt/live/dns.example.com/fullchain.pem) \
+  && echo 'OK: the AGH copy matches the lineage again'
+/usr/local/sbin/dns-smoke.sh; echo "exit=$?"      # SMOKE: PASS, exit=0
+
+# The drill directory holds a SECOND COPY OF THE PRODUCTION PRIVATE KEY. Remove it,
+# and make sure it never reaches a provider snapshot or the Phase K backup set:
+shred -u /root/expired-cert-drill/*.pem /root/expired-cert-drill/*.real 2>/dev/null
+rm -rf /root/expired-cert-drill
+```
+
+PASS overall: the expired certificate was installed, the start-or-refuse branch was recorded, validating clients failed and non-validating ones did not, the smoke gate flagged it on the enddate check and only on the enddate check, and the real certificate is back in place with a clean smoke run and no leftover copy of the key.
 
 ---
 

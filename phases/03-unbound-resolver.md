@@ -8,6 +8,7 @@
   - [C1. Install Unbound and de-fang the distro integration](#c1-install-unbound-and-de-fang-the-distro-integration)
   - [C2. Resolver configuration](#c2-resolver-configuration)
   - [C3. DNSSEC trust anchor lifecycle](#c3-dnssec-trust-anchor-lifecycle)
+  - [C3b. When someone else's DNSSEC breaks](#c3b-when-someone-elses-dnssec-breaks)
   - [C4. Hardened systemd unit](#c4-hardened-systemd-unit)
   - [C5. Verification](#c5-verification)
   - [C6. What recursion costs, and what pays for it](#c6-what-recursion-costs-and-what-pays-for-it)
@@ -98,6 +99,28 @@ The distro's `/etc/unbound/unbound.conf` ends with `include-toplevel: "/etc/unbo
 - `remote-control.conf` already sets `control-enable: yes` and `control-interface: /run/unbound.ctl`. **Unbound's remote control is therefore ENABLED on this box, and it stays enabled** — that is a deliberate part of the design, not an oversight. Every `unbound-control` command in this plan runs over that shipped unix socket, and Phase I's metrics collector reads `unbound-control stats_noreset` through it; disabling remote control blinds Phase I. What you must not do is *redeclare* it. `control-interface` is a **list**, so a second declaration *adds* a channel rather than replacing one. The v1-era instinct to add a `remote-control:` block on TCP 127.0.0.1:8953 gives you a redundant second control channel and forces `unbound-control-setup` certificates that the unix socket does not need. Every `unbound-control` command in this plan works over the shipped socket unchanged. **Do not add a `remote-control:` block.**
 - `root-auto-trust-anchor-file.conf` already sets `auto-trust-anchor-file: "/var/lib/unbound/root.key"`. Declaring it twice is a known breakage. See C3.
 
+#### Decide `do-ip6` before you write the file
+
+`do-ip6` in the config below is a **decision**, and the failure it guards against is the ambiguous one: providers routinely hand out a global IPv6 address whose transit is dead, half-filtered or unrouted. Phase A1's `ip -6 addr show scope global` proves an address was *assigned* and says nothing about whether packets leave. With `do-ip6: yes` on such a host Unbound picks AAAA-addressed authoritatives out of its infra cache, waits out the timeout and retries over v4 — on every cache miss, for every delegation whose nameservers are v6-reachable. It never fails, it only gets slow, so it survives go-live and resurfaces months later as an unattributed recursion p99 that Phase I's `RecursionLatencyP99High` reports without naming the cause.
+
+Test *egress*, not addressing, and test two different root letters so one dead anycast instance cannot decide it for you:
+
+```bash
+ip -6 route show default     # an address with no default route is the common trap
+dig @2001:500:2f::f . NS +time=3 +tries=1 +noall +comments   # f.root-servers.net
+dig @2001:500:1::53 . NS +time=3 +tries=1 +noall +comments   # h.root-servers.net
+```
+
+Both return `status: NOERROR` inside 3 s → `do-ip6: yes`. Either times out → `do-ip6: no`, **and write the reason on the line**, because the next person to read this config will otherwise "fix" it back.
+
+The same fault can arrive *after* go-live, when a provider re-homes transit. Nothing else in this plan detects it, so check the infra cache periodically — v6 peers accumulating high `rto` and `lame`/timeout counts while their v4 siblings stay healthy is the signature:
+
+```bash
+unbound-control dump_infra | awk '$1 ~ /:/ {print}' | head -20
+# Compare rto/lame across the v6 rows and the v4 rows. Sustained v6 rto at the
+# ceiling with healthy v4 = transit broke; set do-ip6: no and re-run the test above.
+```
+
 Write `/etc/unbound/unbound.conf.d/10-public-resolver.conf`:
 
 ```conf
@@ -123,16 +146,28 @@ server:
     access-control: ::1/128 allow
 
     do-ip4: yes
-    do-ip6: yes            # set to `no` if the VPS has no working IPv6 EGRESS.
-                           # A broken v6 route here costs a timeout per query.
+    do-ip6: yes            # DECISION - run the egress test above BEFORE writing
+                           # this line. Set `no` if this VPS has no working IPv6
+                           # EGRESS; a dead v6 route costs a timeout per query and
+                           # degrades silently. Record WHY if you set it to no.
     do-udp: yes
     do-tcp: yes
 
     username: "unbound"    # unbound drops privileges itself - see C4
     chroot: ""             # systemd sandboxing covers isolation and avoids the
                            # chroot path traps (root.hints, root.key, /dev/random)
-    hide-identity: yes
-    hide-version: yes
+    hide-identity: yes     # REFUSE id.server and hostname.bind
+    hide-version: yes      # REFUSE version.bind and version.server
+    hide-trustanchor: yes  # REFUSE trustanchor.unbound. Default is NO, and this is
+                           # the FOURTH CHAOS-class identity probe - the one the
+                           # rest of the stack does not cover. AdGuardHome's
+                           # `blocked_hosts` (Phase E) matches on the question NAME
+                           # and lists only the other three, and `deny-any` gates
+                           # qtype ANY, not class CH. Left unset, an unauthenticated
+                           # CH TXT query reads back this resolver's trust-anchor
+                           # state - confirming the software is unbound after the
+                           # other three were made to lie, and revealing whether an
+                           # anchor is missing or mid-rollover. See C3.
     deny-any: yes          # answer qtype ANY with an empty response
 
     # === SIZING: 2 vCPU / 4 GB shared with AdGuardHome =================
@@ -182,10 +217,15 @@ server:
     aggressive-nsec: yes              # RFC 8198. Default is YES on 1.19.2 and NO
                                       # on 1.13.1 - declared explicitly so a base
                                       # image change cannot silently revert it.
-                                      # This is the main structural defence
-                                      # against random-subdomain (water-torture)
-                                      # floods: cached NSEC/NSEC3 proves whole
-                                      # ranges nonexistent without a query.
+                                      # Cached NSEC/NSEC3 proves whole ranges
+                                      # nonexistent without a query, which is the
+                                      # main structural defence against
+                                      # random-subdomain (water-torture) floods -
+                                      # but SIGNED ZONES ONLY. It is inert when
+                                      # the flooded victim zone is unsigned, which
+                                      # is the usual case. See the rate-limiting
+                                      # section below; `ratelimit` is the
+                                      # complement, not an alternative.
 
     # === PREFETCH: this is what replaces the deleted Phase F warmer ====
     prefetch: yes                     # refresh a cache entry when a query
@@ -301,6 +341,18 @@ server:
     # exemption, Plex remote access breaks for every one of your users.
     private-domain: "plex.direct"
 
+    # === RFC 9462 DDR: resolver.arpa ===================================
+    # unbound 1.19.2 does NOT ship resolver.arpa among its locally-served
+    # zones - upstream added resolver.arpa and service.arpa to the defaults
+    # in January 2025, after this release. Verified against the noble
+    # unbound.conf(5) default list, which has home.arpa but neither of
+    # those. So `_dns.resolver.arpa` SVCB probes from Windows 11, iOS 17+
+    # and macOS 14+ clients recurse out to the .arpa authoritatives.
+    # This line is the DEFAULT side of a decision - read the DDR section
+    # below before changing it. Delete it if you move to a base image whose
+    # unbound already ships the zone (`unbound-control list_local_zones`).
+    local-zone: "resolver.arpa." always_nxdomain
+
     # === LOGGING =======================================================
     verbosity: 1           # NOT 0. Level 1 is operational errors plus the
                            # val-log-level bogus lines - it does not log queries.
@@ -385,19 +437,78 @@ RFC 7873/9018 cookies are available on 1.19.2 (`answer-cookie`, default no; `coo
 
 The real cookie gap is at the public edge: AdGuardHome implements no DNS cookies, so plain Do53 to your service has no cookie protection. That is a Phase E / security-phase matter, not something Unbound can fix from behind the gateway. Record it in the runbook as a known limitation and steer users to DoT/DoH/DoQ, which are connection-oriented and not spoofable. Do not try to close it by moving Unbound to the public edge — `access-control` is global rather than per-listener (see the comment in the config), and moving plain Do53 off AdGuardHome would blind the Phase J abuse pipeline for exactly the traffic class that gets abused.
 
+#### RFC 9462 DDR (`_dns.resolver.arpa`) — a decision, not an omission
+
+Windows 11, iOS 17+ and macOS 14+ clients that reach this service over plain Do53 send an SVCB query for `_dns.resolver.arpa` to ask the resolver they are already using whether it also offers an encrypted transport. This deployment offers three — DoT and DoQ on :853, DoH via nginx — and today answers that question with someone else's NXDOMAIN. That quietly undercuts the position taken in the cookie note above, where steering users onto DoT/DoH/DoQ *is* the stated mitigation for the unprotected Do53 path.
+
+Two facts to get right before choosing:
+
+- **The leak is real but small.** `resolver.arpa` is not delegated in `.arpa`. Verified on the wire: `_dns.resolver.arpa SVCB` returns NXDOMAIN proved by `m.ns.arpa. NSEC service.arpa.` at TTL 86400, together with `arpa. NSEC as112.arpa.` ruling out a `*.arpa` wildcard. Both are signed, both cache, and `aggressive-nsec: yes` synthesises every repeat locally. So the cost is roughly **one outbound query per NSEC TTL, not one per client boot** — worth closing, not worth alarm.
+- **The Do53 path terminates at AdGuardHome, not here.** An SVCB answer therefore has to be manufactured in Unbound and relayed by AdGuardHome, which forwards the query upstream like any other. There is no AdGuardHome-side place to put it.
+
+**Option A — decline discovery (the shipped default).** The `local-zone: "resolver.arpa." always_nxdomain` line in C2. One line, no prerequisites, no certificate work. It returns to the client exactly the answer the `.arpa` authoritatives return today, minus the round trip, so no client behaviour changes. RFC 9462's NODATA guidance is addressed to resolvers that *do* support DDR; a resolver that does not is not made more conformant by pretending otherwise.
+
+**Option B — offer discovery.** Replace that line with a static zone and publish the SVCB set:
+
+```conf
+    # UNVERIFIED for 1.19.2: SVCB in `local-data` presentation format is not
+    # something this plan has run. `unbound-checkconf` is the gate - if it
+    # rejects these lines, Option B is not available to you on this build.
+    local-zone: "resolver.arpa." static
+    local-data: '_dns.resolver.arpa. 300 IN SVCB 1 dns.example.com. alpn="dot" port=853'
+    local-data: '_dns.resolver.arpa. 300 IN SVCB 2 dns.example.com. alpn="doq" port=853'
+    local-data: '_dns.resolver.arpa. 300 IN SVCB 3 dns.example.com. alpn="h2,h3" dohpath="/dns-query{?dns}"'
+```
+
+**Option B has a Phase D prerequisite that is not optional and is not cheap.** RFC 9462 s4.2 requires that a client upgrading away from an *unencrypted* resolver verify the designated resolver's certificate contains **the IP address of the unencrypted resolver, as an `iPAddress` entry in the subjectAltName**. Phase D issues a name-only certificate, so conformant clients would fetch the SVCB and then refuse the upgrade — strictly worse than Option A, because you have taken on the work and gained nothing. Closing that needs an IP-address SAN, and the current state of that (as of this writing) is: Let's Encrypt made IP-address certificates generally available on **2026-01-15**, but only through the `shortlived` profile — a **160-hour (six-day) lifetime** — with certbot support via `--ip-address`, new in **certbot 5.3**. That is a different renewal cadence, a different failure budget and a different deploy-hook risk profile from Phase D's 90-day name certificate, and it is Phase D's call to make. **Verify all of that against Let's Encrypt's current documentation before committing** — this is the fastest-moving fact in this plan.
+
+**Recommended default: Option A.** It is one line, it is honest about what this resolver offers, and it costs nothing. Take Option B only when Phase D has actually issued and renewed an IP-SAN certificate at least once, and record the choice in the Phase Q decision register either way. **Doing neither is the current state and is the worst of the three** — the query leaks *and* nobody upgrades.
+
 #### Rate limiting on the recursive leg
 
 Two knobs exist and only one of them is appropriate:
 
 - **`ip-ratelimit` — do not set it.** It is per-source-IP, and this daemon's only source IP is `127.0.0.1`. Setting it rate-limits your own gateway.
-- **`ratelimit`** is per-zone, capping queries unbound sends to a given zone's authoritative servers. That *is* the right shape for blunting a random-subdomain flood that gets past AdGuardHome's limiter. Default is 0 (off). If you enable it, understand that too low a value produces SERVFAILs for large legitimate zones:
+- **`ratelimit`** is per-zone, capping queries unbound sends to a given zone's authoritative servers — the manpage's wording is "ratelimiting of queries sent to nameserver for performing recursion", default 0. That *is* the right shape for blunting a random-subdomain flood that gets past AdGuardHome's limiter. Too low a value produces SERVFAILs for large legitimate zones:
 
 ```conf
     # ratelimit: 1000    # per-zone outgoing qps. Measure your normal per-zone
                          # peak before enabling; start well above it.
 ```
 
-Leave it off at go-live. `aggressive-nsec` is the primary structural defence against random-subdomain floods and is already on; add `ratelimit` only if Phase I observability shows a zone-directed flood actually reaching the recursive leg.
+**`aggressive-nsec` is not a substitute for it, and this is the correction that matters.** RFC 8198 synthesis works from cached NSEC/NSEC3, so it covers **signed zones only**. It is inert against a flood aimed at an *unsigned* victim zone — and attackers pick unsigned victims precisely because cached denial cannot be synthesised for them. Where a flood against a signed zone costs you nothing, the same flood against an unsigned one costs a full recursion per query. The two controls are complements with disjoint domains, not alternatives — and everywhere `aggressive-nsec` is called a structural defence, in C2's config comment and in C6, it is qualified accordingly.
+
+**The trigger for enabling it, stated so it can actually be satisfied.** The obvious formulation — "enable `ratelimit` once observability shows a zone-directed flood reaching the recursive leg" — is unsatisfiable on this stack, and saying it would leave the operator waiting for a signal that cannot arrive. Phase I's Unbound collector is a *generic* mapper over `unbound-control stats_noreset`, whose counters carry no per-zone and no per-destination breakdown. Use the signals that do exist:
+
+- `CacheHitRatioCollapsed`, `QPSSpike` and `RequestListExceeded` (Phase I) all fire in this scenario. None of them names a zone.
+- `rate(unbound_total_num_recursivereplies[10m])` climbing while the cache-hit ratio falls is the specific shape of cache-busting traffic being converted into outbound recursion.
+- To get the zone name, use Phase J's identification step (`tcpdump` on the query names) or `unbound-control dump_infra`, which shows which authoritatives you are hammering.
+
+**When you do enable it**, note that `ratelimit` is not a hard stop: `ratelimit-factor` defaults to **10**, meaning one query in ten still goes out once the cap is hit. Prove it engaged, and prove it is not clamping a legitimate zone:
+
+```bash
+# Runtime, no restart, no cache flush. `ratelimit` is one of the options
+# unbound-control(8) lists as settable; note the mandatory trailing colon and
+# the space before the value. It is NOT written to the config file, so it
+# vanishes on restart - which is what you want during an incident.
+unbound-control set_option ratelimit: 1000
+unbound-control get_option ratelimit
+unbound-control stats_noreset | grep 'num.query.ratelimited'
+#   rises while the flood runs; must stay flat once it stops. A counter that
+#   keeps climbing on normal traffic means the value is too low - raise it.
+```
+
+To keep it, put the line in `10-public-resolver.conf` and `unbound-control reload`; `set_option` alone is deliberately temporary.
+
+Leave it off at go-live. The structural bound that is genuinely already in place is Phase B's ingress cap — 400/s per source plus the global pps backstop — which limits how much outbound recursion any single source can induce; see Phase B, which owns the packet layer.
+
+**The direction this plan otherwise never covers is you as the flood *source*.** The abuse material treats this box as a reflector or a victim. A random-subdomain flood pointed *through* you at someone else's unsigned zone puts your address on the victim's abuse report, and a provider-AUP suspension is the outcome Phase Q names as most likely to end the service. The shape is distinctive and does not match the reflector playbook: outbound-heavy traffic concentrated on one zone's authoritatives, and an abuse complaint naming a victim *domain* rather than a victim IP. The response is `ratelimit` plus, for as long as the flood runs, a hard stop on the targeted zone:
+
+```conf
+    local-zone: "<victim-zone>." refuse
+```
+
+Reload to apply, and **name the cost when you do it**: `refuse` answers REFUSED for that zone to *your own users* as well, so you are taking the victim's domain offline for them in order to stop being the thing hurting it. It is a tourniquet with an expiry, tracked the same way a negative trust anchor is in C3b. Phase J owns the runbook entry.
 
 #### One cross-phase edit this section forces
 
@@ -422,6 +533,29 @@ journalctl -u unbound --since '5 min ago' | grep -i 'ulimit\|outgoing port' \
 # open; the live probe in C5 can.
 grep -c '^ *private-address:' /etc/unbound/unbound.conf.d/10-public-resolver.conf   # 18
 grep -c '^ *private-domain:'  /etc/unbound/unbound.conf.d/10-public-resolver.conf   # 1
+
+# All FOUR CHAOS identity probes are closed, not three. The first three are
+# closed twice over (here and in AdGuardHome's blocked_hosts, Phase E);
+# trustanchor.unbound is closed only here, so it is the one that needs asserting.
+for q in id.server hostname.bind version.bind trustanchor.unbound; do
+  printf '%-22s ' "$q"
+  dig @127.0.0.1 -p 5335 -c CH -t TXT "$q" +noall +comments 2>/dev/null \
+    | sed -n 's/.*status: \([A-Z]*\).*/\1/p'
+done
+#   all four: REFUSED. Repeat the trustanchor.unbound probe from OFF-BOX in
+#   Phase H - AdGuardHome forwards it rather than blocking it by name, so the
+#   guarantee is carried by hide-trustanchor and by nothing else:
+#     kdig @dns.example.com +tls -c CH -t TXT trustanchor.unbound
+
+# IPv6 egress matches what do-ip6 claims. `yes` with no default route is exactly
+# the silent-degradation case the pre-flight test in C2 exists to catch.
+unbound-control get_option do-ip6
+ip -6 route show default || echo 'NO DEFAULT V6 ROUTE - do-ip6 must be no'
+
+# resolver.arpa is answered locally, not recursed (the C2 DDR decision)
+unbound-control list_local_zones | grep '^resolver.arpa.'         # always_nxdomain
+dig @127.0.0.1 -p 5335 _dns.resolver.arpa SVCB +noall +comments +stats \
+  | grep -E 'status:|Query time'                                  # NXDOMAIN, ~0 ms
 ```
 
 ---
@@ -534,12 +668,85 @@ This covers all three failure modes, heals instead of racing, and keys off the *
 
 #### Detecting the state before it bites
 
-The daily guard is the backstop. The fast detector belongs in `/etc/cron.d/dns-health`, which **Phase I creates** — append these two lines to that file rather than dropping a second cron file beside it, and let Phase I's `/usr/local/sbin/notify.sh` own the escalation off the box; `logger` here is the local audit trail, not the pager. **Use the root zone, not a third-party test zone** — a five-minute check against a university-run domain fires 288 queries a day at someone else's infrastructure and pages you whenever *their* zone or its network path is down:
+The daily guard is the backstop. The fast detector belongs in `/etc/cron.d/dns-health`, which **Phase I creates** — append these three lines to that file rather than dropping a second cron file beside it, and let Phase I's `/usr/local/sbin/notify.sh` own the escalation off the box; `logger` here is the local audit trail, not the pager. **Use the root zone, not a third-party test zone** — a five-minute check against a university-run domain fires 288 queries a day at someone else's infrastructure and pages you whenever *their* zone or its network path is down:
 
 ```bash
 */5 * * * * root dig @127.0.0.1 -p 5335 . DNSKEY +dnssec +time=2 +tries=1 2>/dev/null | grep -q '^;; flags:.* ad' || echo "DNSSEC VALIDATION BROKEN (trust anchor?)" | logger -t dns-alert
 0 6 * * * root [ -s /var/lib/unbound/root.key ] || echo "root.key EMPTY" | logger -t dns-alert
+13 5 1 * * root /usr/local/sbin/anchor-state-check.sh
 ```
+
+The third line is the subject of the next section, and it is not redundant with the first two.
+
+#### Inspect the anchor's state, not its size
+
+**Every check written above passes cleanly on a host that is 30 days from total SERVFAIL.** They test exactly two things — that `root.key` is non-empty, and that `. DNSKEY` still comes back with the AD flag — and both hold throughout an entire RFC 5011 rollover window, while the incoming key sits in ADDPEND and the outgoing one is still VALID and still signing. Nothing so far looks *inside* the file.
+
+Unbound records per-key state in the anchor file itself, one line per key:
+
+```bash
+grep ';;state=' /var/lib/unbound/root.key
+#   . 172800 IN DNSKEY 257 3 8 AwEAA...  ;{id = 20326 (ksk), size = 2048b} \
+#     ;;state=2 [  VALID  ] ;;count=0 ;;lastchange=...
+```
+
+Key tag and state sit on the same line, which is what makes a per-key assertion a one-line grep. **Read the bracketed label, not the number** — the label is self-documenting and survives a version change. What they mean operationally:
+
+| Label | Meaning |
+|---|---|
+| `ADDPEND` | seen, counting down the add hold-down, **not yet trusted** |
+| `VALID` | trusted for validation right now |
+| `MISSING` | was VALID, absent from the last successful refresh, still trusted |
+| `REVOKED` | the root explicitly revoked it; it will be dropped |
+
+The hold-down is not short: `add-holddown` defaults to **2592000 seconds (30 days)**, per RFC 5011. A host that first observes a new KSK inside 30 days of the day it starts signing alone is *not* safe merely because the key is in the file. `del-holddown` is likewise 30 days and `keep-missing` 366 days.
+
+**The root KSK rollover is a scheduled, dated, service-killing event, and one is in flight.** As of this writing the published ICANN schedule is: KSK-2024, **key tag 38696**, first published in the root DNSKEY RRset in January 2025, RFC 5011 add hold-down completed around 10 February 2025; from **11 October 2026 it signs the root zone alone**; the outgoing KSK-2017, **key tag 20326**, remains published but stops signing then, is revoked in January 2027 and is deleted in mid-2027. **Verify these dates against ICANN's own rollover page before you rely on them** — they have slipped before. What follows from them does not change: on the signing date, any resolver whose anchor does not hold 38696 in `VALID` SERVFAILs every signed name on earth, and the C3 guard above will fire into an outage with nothing to heal from, because the anchor it would re-bootstrap is the one that is already wrong.
+
+`/usr/local/sbin/anchor-state-check.sh`:
+
+```bash
+#!/bin/bash
+# REPORT ONLY. This script must never stop unbound and never call unbound-anchor.
+# Re-bootstrapping mid-rollover discards the RFC 5011 tracking state the rollover
+# depends on. Healing a DEAD anchor belongs to unbound-anchor-guard.sh, which
+# fires only once validation has already stopped - a different fault.
+set -uo pipefail
+KEY=/var/lib/unbound/root.key
+NEW_KSK=38696                      # KSK-2024. Update at the next announced roll.
+N=/usr/local/sbin/notify.sh        # Phase I owns this; signature is
+                                   # notify.sh <severity> <title> [message]
+
+# Match the BRACKETED label, never the bare word: "VALID" can occur by chance
+# inside the base64 key material and a false pass here is the exact failure this
+# check exists to prevent.
+V='\[ *VALID *\]'
+
+grep -q ';;state=' "$KEY" || { "$N" critical "root.key carries no RFC 5011 state" "$KEY"; exit 1; }
+grep -q "$V"       "$KEY" || { "$N" critical "no root trust anchor is VALID" "$(grep -o ';;state=[0-9] \[[^]]*\]' "$KEY")"; exit 1; }
+
+line=$(grep "id = $NEW_KSK " "$KEY" || true)     # trailing space: exact tag match
+if [ -z "$line" ]; then
+  "$N" critical "root KSK-$NEW_KSK absent from root.key" \
+       "This host SERVFAILs every signed name once that key signs the root alone."
+elif ! printf '%s\n' "$line" | grep -q "$V"; then
+  "$N" warning "root KSK-$NEW_KSK present but not yet VALID" "$line"
+fi
+
+# RFC 5011 tracking rewrites this file as it probes. A long-stale mtime means
+# tracking has stopped even though the AD flag still passes. Measure your own
+# box's rewrite cadence during burn-in and tighten this threshold to match.
+[ -n "$(find "$KEY" -mtime +90)" ] && \
+  "$N" warning "root.key not rewritten in 90 days" "RFC 5011 tracking has probably stopped"
+exit 0
+```
+
+```bash
+chmod 0750 /usr/local/sbin/anchor-state-check.sh
+/usr/local/sbin/anchor-state-check.sh; echo "exit=$?"   # 0, and no notification
+```
+
+**Track the announcements, not just the file.** Subscribe to `ksk-rollover@icann.org` and watch IANA's root-anchors page. Put each announced rollover date into the same calendar as the Phase K restore drill and record it in the Phase O inventory: this is the one dependency in the whole design whose breakage has a date on it months in advance, and the only thing that converts it from a scheduled task into an outage is nobody looking.
 
 Add `/var/lib/unbound/root.key` to the Phase K backup set.
 
@@ -554,6 +761,17 @@ stat -c '%U:%G %a %s' /var/lib/unbound/root.key    # unbound:unbound 644, non-ze
 # version, threads, modules, uptime. Use get_option:
 unbound-control get_option auto-trust-anchor-file  # /var/lib/unbound/root.key
 
+# The anchor's CONTENTS, which no other check in this plan looks at. A host
+# mid-rollover passes every check above and fails this one.
+grep ';;state=' /var/lib/unbound/root.key
+#   expect at least one [  VALID  ]; during the current rollover expect BOTH
+#   id = 20326 (KSK-2017) and id = 38696 (KSK-2024), and 38696 must read VALID,
+#   not ADDPEND, well before the date it starts signing the root alone.
+grep -c '\[ *VALID *\]' /var/lib/unbound/root.key             # >= 1
+grep 'id = 38696 ' /var/lib/unbound/root.key | grep -c '\[ *VALID *\]'   # 1
+find /var/lib/unbound/root.key -mtime +90          # must print NOTHING
+/usr/local/sbin/anchor-state-check.sh; echo "exit=$?"         # 0, no notification
+
 # The guard must NOT touch a healthy anchor
 systemctl list-timers unbound-anchor-guard.timer --all
 MT=$(stat -c %Y /var/lib/unbound/root.key)
@@ -567,6 +785,122 @@ journalctl -t unbound-anchor --since '5 min ago'                 # empty on a he
 # /usr/local/sbin/unbound-anchor-guard.sh
 # dig @127.0.0.1 -p 5335 . DNSKEY +dnssec | grep ' ad'   # 'ad' is back
 ```
+
+---
+
+### C3b. When someone else's DNSSEC breaks
+
+C3 is entirely about *your* anchor. This section is about the fault that arrives far more often: a zone operator breaks their own signing — expired RRSIGs, a botched KSK roll, a DS that no longer matches the DNSKEY — and a validating resolver correctly refuses to answer for a name that every forwarder-based resolver on the internet still resolves. It presents to your users as **"your resolver is broken, 1.1.1.1 works fine"**, and without a procedure your only documented exits are to disable validation globally or to tell people to switch resolvers. Both destroy the property this whole design exists to provide.
+
+#### Tell the two faults apart first
+
+| Symptom | Cause | Section |
+|---|---|---|
+| **Every** signed zone SERVFAILs; `. DNSKEY` has no AD flag | your anchor, your clock, your box | C3 |
+| **One** zone SERVFAILs; the root and everything else validate | their zone | here |
+
+The distinction is load-bearing because the Phase N7 runbook row keys on the word SERVFAIL and prescribes `unbound-anchor` plus a restart. Run that against this fault and you pay a full cache dump on a live resolver to repair an anchor that was never broken.
+
+#### Confirm it is them, not you
+
+```bash
+Z=broken.example                       # the zone the user reported
+
+# 1. Our verdict, with the reason attached. C2 sets `ede: yes`, so the SERVFAIL
+#    carries an RFC 8914 code: 6 (DNSSEC Bogus), 7 (Signature Expired),
+#    8 (Signature Not Yet Valid), 9 (DNSKEY Missing), 10 (RRSIGs Missing).
+dig @127.0.0.1 -p 5335 "$Z" A +dnssec +noall +comments
+
+# 2. Second opinion from two resolvers that also validate. If they SERVFAIL too,
+#    it is the zone - not this box.
+dig @8.8.8.8 "$Z" A +noall +comments; dig @1.1.1.1 "$Z" A +noall +comments
+
+# 3. What exactly failed, and at which cut. delv sets CD, so it fetches the raw
+#    records through us and validates locally - which is why it can name the
+#    fault where the resolver can only say SERVFAIL. Installed by Phase A1 as
+#    part of bind9-dnsutils. If it answers "No trusted keys were loaded", that
+#    is delv's own anchor file missing, not a fault on this resolver; fall back
+#    to the EDE code from step 1.
+delv @127.0.0.1 -p 5335 +rtrace "$Z" A
+
+# 4. Which authoritatives we would even be asking
+unbound-control lookup "$Z"
+```
+
+#### The negative trust anchor, time-boxed
+
+A negative trust anchor suspends validation **for one subtree and nothing else**. It is legitimate in exactly one situation: you have confirmed by the steps above that a third party's zone is bogus, the outage is theirs, and your users need the name before they will fix it. It is never a response to a fault you have not diagnosed, and never a response to your own anchor.
+
+```bash
+unbound-control insecure_add "$Z"      # suspend validation for $Z and below
+unbound-control list_insecure          # what is currently suspended
+```
+
+**Scope it as narrowly as the fault allows.** Cut at the broken zone's own apex, not at its parent, and never at a TLD — `insecure_add example.com` to fix `status.example.com` unvalidates every name the company operates. The apex you want is the one named in the `delv +rtrace` output as the point where the chain fails.
+
+**Two properties of `insecure_add` worth stating explicitly**, both from unbound-control(8): it "adds to the running Unbound ... does not affect the config file", and it does not touch cached data. The first means an NTA **evaporates on restart, by design** — that is the feature, not a limitation, because it converts "forgot to remove it" into a bounded exposure. The second is the next section.
+
+#### Removing it is the part people skip
+
+**A permanent NTA is a silent downgrade.** That zone is unvalidated for your users forever, nothing on the box reports it, and the operator who reads `list_insecure` two years later will not know whether the entry is still needed. Treat removal as part of the same task:
+
+```bash
+# Schedule the removal at the same moment you create the NTA. systemd-run needs
+# no extra package - `at` is NOT in Phase A1's install list.
+systemd-run --on-active=24h --unit=nta-expire-"${Z//./-}" \
+  /usr/bin/unbound-control insecure_remove "$Z"
+systemctl list-timers 'nta-expire-*' --all      # the removal is on the calendar
+
+# Re-test on a cadence until they fix it; when the AD flag returns, drop it.
+unbound-control insecure_remove "$Z"
+unbound-control list_insecure          # must no longer list it
+```
+
+Once the zone operator has repaired their zone, **`flush_zone` alone is not enough and this is the trap**. It walks the cache and expires entries at or below the name, but the *bogus* verdict and the cached SERVFAIL/NXDOMAIN are separate stores; with `serve-expired` on (C2) `flush_zone` marks entries expired rather than removing them. Leave those in place and the zone keeps failing after the fix, which reads exactly like the NTA removal having not worked:
+
+```bash
+unbound-control flush_zone "$Z"        # expires entries at or below the name
+unbound-control flush_bogus            # drops all cached BOGUS data
+unbound-control flush_negative         # drops cached NXDOMAIN / NODATA / SERVFAIL,
+                                       # plus bad key entries from the DNSSEC key
+                                       # cache - which is where a failed DNSKEY
+                                       # fetch for their zone is still sitting
+dig @127.0.0.1 -p 5335 "$Z" A +dnssec +noall +comments | grep '^;; flags:'   # ' ad'
+```
+
+`flush_bogus` and `flush_negative` are global, not per-zone. On a busy resolver that is a small, real cost — a burst of re-resolution — which is why they belong in the repair procedure and not in a cron job.
+
+#### Do not persist it in the config file
+
+`domain-insecure:` is the config-file form of the same thing, and it is the one that turns a two-hour incident into a permanent, invisible security regression. Reach for it only when a zone is *structurally* unsigned in your environment and never for a third-party outage; if you ever do add one, open a ticket with an expiry date in the same change. Then make the config prove it:
+
+```bash
+grep -n 'domain-insecure' /etc/unbound/unbound.conf.d/*.conf \
+  && echo 'REVIEW: validation is permanently disabled for the zones above' \
+  || echo 'no persistent NTA'
+```
+
+Add that grep to the Phase O drift check and to the Phase L go-live gate, so a forgotten `domain-insecure:` cannot sit in the config disabling validation for a zone forever.
+
+**Verify C3b**
+
+```bash
+unbound-control list_insecure          # EMPTY on a healthy box - this is the steady state
+grep -c 'domain-insecure' /etc/unbound/unbound.conf.d/*.conf   # 0
+
+# Dry run of the whole procedure against a zone that is bogus on purpose, so the
+# operator has run it once before the night it matters:
+dig @127.0.0.1 -p 5335 dnssec-failed.org A +noall +comments      # SERVFAIL
+unbound-control insecure_add dnssec-failed.org
+unbound-control flush_zone dnssec-failed.org; unbound-control flush_bogus
+dig @127.0.0.1 -p 5335 dnssec-failed.org A +noall +comments      # NOERROR, no 'ad'
+unbound-control insecure_remove dnssec-failed.org
+unbound-control flush_zone dnssec-failed.org; unbound-control flush_bogus
+dig @127.0.0.1 -p 5335 dnssec-failed.org A +noall +comments      # SERVFAIL again
+unbound-control list_insecure                                    # empty
+```
+
+That last SERVFAIL is the point of the drill: it proves the NTA was removed and validation is back on, which is the step that gets forgotten.
 
 ---
 
@@ -779,6 +1113,9 @@ unbound-control get_option private-domain 2>/dev/null || \
 
 # Built-in special-use zones (RFC 6303/6761/7686/8375) answer locally.
 # Do NOT add local-zone overrides for these - unbound already ships them.
+# The ONE exception is resolver.arpa, which 1.19.2 does not ship and C2 adds
+# by hand; `unbound-control list_local_zones` is the authority on which of the
+# two categories a given name is in on your build.
 dig @127.0.0.1 -p 5335 facebookwkhpilnemxj7asaniu7vnjjbiltxjqhye3mhbshg7kx5tfyd.onion A +noall +comments  # NXDOMAIN
 dig @127.0.0.1 -p 5335 1.168.192.in-addr.arpa PTR +noall +comments   # NXDOMAIN, not a recursion
 dig @127.0.0.1 -p 5335 localhost A +short                            # 127.0.0.1
@@ -914,7 +1251,7 @@ Be honest with yourself about the trade before go-live, because the first compla
 - **`prefetch: yes` is the main mitigation and it is well matched to real traffic.** A resolver's query distribution is extremely long-tailed: a small hot set accounts for most queries, and prefetch refreshes exactly that set before expiry, so the hot set effectively never pays the cold-recursion cost. Unlike the deleted Phase F warmer, it learns the hot set from your users rather than from a list guessed in advance, and it generates no query traffic of its own.
 - **`prefetch-key: yes`** removes a serialised DNSKEY fetch from the validation path on the misses that remain.
 - **Cache sizing** (256m RRset / 128m msg) is deliberately generous for a 2 vCPU box. The dominant cost of recursion is the cache miss; the cheapest way to buy it back is to make misses rarer. This memory is the single highest-return line in C2.
-- **`aggressive-nsec: yes`** answers a whole class of misses — nonexistent names under a signed zone — from cached NSEC/NSEC3 records with no query at all. Against random-subdomain floods this is the difference between a flood costing you one recursion per query and costing you nothing.
+- **`aggressive-nsec: yes`** answers a whole class of misses — nonexistent names under a **signed** zone — from cached NSEC/NSEC3 records with no query at all. Against a random-subdomain flood aimed at a signed zone this is the difference between one recursion per query and none. Against a flood aimed at an *unsigned* zone it does nothing at all, and attackers choose unsigned victims for that reason; that case is `ratelimit`'s, per C2's rate-limiting section.
 - **`serve-expired` with the RFC 8767 client timeout** bounds the worst case: when recursion genuinely stalls, a client waits 1.8 seconds and then gets a stale-but-labelled answer rather than a SERVFAIL.
 
 Measure the miss cost on your own box rather than trusting the ranges above — `dig +stats` after `unbound-control flush_zone`, per C5.5 — and record the number. It is the baseline that Phase H's load test and Phase I's latency alerting are calibrated against.

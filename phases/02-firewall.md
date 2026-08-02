@@ -1108,6 +1108,12 @@ test -e /usr/local/sbin/nft-bans \
 Everything below runs on the box unless marked *off-box*. Two shell variables to set
 first: `PUB=<public IPv4>` and, if you have one, `PUB6=<public IPv6>`.
 
+Steps 4, 5, 7, 8, 9 and 10 are the *off-box* ones, and step 4 is where the second machine
+is first needed — so provision it before you start this section rather than when you reach
+Phase H. It is the same test host Phase H builds in H0: a small VPS in the same region
+with `dnsperf` and `knot-dnsutils` installed. Step 9 also wants `nmap`, which is not in
+H0's package list; add it here.
+
 **1. The ruleset is what you think it is.**
 
 ```bash

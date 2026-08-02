@@ -18,11 +18,152 @@
 
 ### A1. Provision the VPS, and know what will break first
 
-**Baseline spec: 2 vCPU, 4 GB RAM, 40 GB SSD, static IPv4, Ubuntu 24.04 LTS.** Optional
-static IPv6. Any provider with low-latency transit and a stable IP (Hetzner, Vultr,
-DigitalOcean and equivalents are all fine). Do not accept a provider that reassigns the IP
-on reboot — the IP is published in DNS records, in client configuration, and in a
-Certificate Transparency log.
+**Before you pay: six things the spec sheet does not tell you.** A machine that meets the
+baseline spec below can still be unable to run this service, and four of these six can end
+it outright. None is visible from a pricing page. Get the answers in writing before the
+first invoice and record them in the Phase Q6 decision register — not at go-live, which is
+where the plan otherwise routes you, and which is after the box is bought and eleven phases
+of work are on it. A seventh question — whether traffic is included or metered — decides
+cost rather than feasibility, and is in the cost model at the end of this step; ask it in the
+same ticket.
+
+1. **The acceptable-use terms permit a public recursive resolver.** Several providers
+   restrict or forbid one outright, and the normal enforcement is suspension rather than a
+   warning — the first time your address appears in somebody's reflection report. Phase Q
+   covers what to do about abuse complaints once you are live; *this* check is whether you
+   are allowed to be live at all. If the terms are ambiguous, ask by ticket and keep the
+   reply.
+2. **Outbound UDP/53 to arbitrary destinations is unfiltered and not transparently
+   redirected.** Decision 2 makes this box recurse from the root; a provider that silently
+   NATs port 53 into its own cache breaks that premise, and it presents as strange partial
+   resolution rather than as a clean failure — Phase C will read as a config bug for a day.
+   Test it on an hourly instance before committing:
+
+```bash
+dig +norecurse @198.41.0.4 . NS +noall +comments +answer
+#   expect: flags include `aa` and NOT `ra`; the answer is the root NS set.
+#   `ra` set, or an answer with no `aa`, means something in the path is
+#   answering for the root and you are not recursing from it.
+dig +norecurse @198.41.0.4 hostname.bind CH TXT +short
+#   expect: a root-server site identifier. Empty, or anything that looks like a
+#   provider appliance, disqualifies the provider for this build.
+dig +norecurse @198.41.0.4 . DNSKEY +bufsize=1232 +noall +comments +stats
+#   expect: ~1 KB of answer, no `tc` flag. No answer at all means the path drops
+#   large UDP responses and Phase C will limp on every DNSSEC-signed delegation.
+#   (A `tc` flag here is legitimate during a root KSK rollover; silence is not.)
+```
+
+3. **PTR for your address is self-service, or available by ticket.** Phase Q sets the PTR
+   to `dns.example.com` so an abuse complaint routes to you rather than to a null-route. A
+   provider that will not set or delegate reverse DNS makes that impossible, and Phase L
+   gates on it.
+4. **A movable floating or reserved IP object exists, with an API token** — required only
+   if you intend Phase N's Tier 3, which is the tier Phase N recommends for a service with
+   users who will notice an outage. Tier 3 moves one address between two hosts. It cannot
+   be retrofitted onto a provider that has no such object; the retrofit is a migration of
+   both nodes.
+5. **The address is static across reboot *and* rebuild.** It is published in DNS, in every
+   client's configuration, and permanently in a Certificate Transparency log. A provider
+   that reassigns on reboot is disqualified outright; one that reassigns on rebuild makes
+   the Phase K restore drill destructive.
+6. **There is an out-of-band console** (serial or VNC), and you have tested that you can
+   reach it. Two failure modes in this plan are recoverable only from outside the network
+   stack: a firewall change that locks out SSH, and the chrony/DNSSEC deadlock in A2. Both
+   leave a box that is running and unreachable by any path this plan builds.
+
+**Baseline spec: 2 vCPU, 4 GB RAM, 40 GB SSD, static IPv4, Ubuntu 24.04 LTS.** IPv6 is a
+decision, not an option — see below. Any provider with low-latency transit that satisfies
+the six checks above will do; Hetzner, Vultr, DigitalOcean and equivalents all meet the
+*spec*, but whether they meet 1–6 is a property of their current terms and your region, not
+of the name, and it is your check to run.
+
+**Provision two instances, not one.** Phase B9's ruleset verification — the conntrack-fill
+run, the flood-guard ban proof, the amplification measurement, the loopback-port probes and
+the public-surface `nmap` — cannot be evaluated from the DNS host. Run locally, those checks
+bypass the NIC, the firewall, the `raw`-table NOTRACK bypass and the rate limiter, and they
+pass on a completely broken box; the Phase L preamble says exactly this about the same
+commands. The second machine is built in **Phase H0** (tooling, and the `RTT_base` baseline
+the Phase L latency gates are stated against), but it is *needed from Phase B9 onward* —
+build it in the same region before you start Phase B, and destroy it once Phase L signs off.
+On an hourly-billed instance that is a few euro for the whole build.
+
+**IPv6: decide before you provision, and make every layer agree.** Two independent decisions
+hide behind "IPv6 support", and the first is routinely mis-stated as a listener setting when
+it is not one.
+
+| Decision | What it governs | Set in | Default |
+|---|---|---|---|
+| **Service family** | which families clients can reach you on | the A/AAAA you publish; nginx `listen` (Phase E) — **not** `dns.bind_hosts` | **IPv4-only** — publish no AAAA |
+| **Recursion egress family** | which families Unbound uses to reach authoritative servers | `do-ip6` (Phase C) | **on if and only if v6 egress is proved** — C2's egress test |
+
+They really are independent: an IPv4-only *service* still wants v6 *egress*, because a
+growing share of authoritative servers are reachable only over IPv6.
+
+**The listener is not where this gets decided.** Phase E ships `dns.bind_hosts: [0.0.0.0]`,
+and a *wildcard* listen address in Go is a request for both address spaces, not for IPv4:
+`favoriteAddrFamily` (`net/ipsock_posix.go`) returns `AF_INET6` with `ipv6only=false` and
+`setDefaultSockopts` then sets `IPV6_V6ONLY=0` on the socket explicitly. So on any host with
+a usable IPv6 stack, AdGuardHome's Do53, DoT and DoQ listeners **already answer over both
+families** with the shipped file untouched. Phase E's nginx binds `listen [::]:443`
+separately because nginx is the opposite shape — `[::]` there defaults to `ipv6only=on`.
+Phase B's ruleset is a family-agnostic `table inet` with `floodmeter6`, `banned_ips6` and
+`allowlist6` already in it. Phase E's E2a is the reference for all of this; nothing below is
+a `bind_hosts` edit.
+
+What is genuinely left to decide is therefore **which records you publish** and **whether v6
+egress works** — not which families the sockets accept. The one case where the listener still
+bites is a host with no usable IPv6 stack at all: Go's probe cannot open an `AF_INET6` socket,
+falls back to `AF_INET`, and an AAAA published against that host is a record with no listener
+behind it. An Android Private DNS client on a v6-preferred mobile network then fails **closed**
+with no fallback, and a Happy-Eyeballs client stalls before falling back. No Phase H test
+catches that, because they all resolve a single `<PUBLIC_IP>` that is implicitly v4; E6 step 9
+is the check that does, because it derives its address list from DNS.
+
+**If you choose IPv4-only** (the default): publish an A record and **no AAAA** — that single
+omission is what makes the decision real, and a hosting control panel will helpfully undo it
+for you. Leave Phase B's `banned_ips6` / `allowlist6` / `floodmeter6` in place; on a v4-only
+*record set* the wildcard socket still accepts IPv6 from anyone who learns the address by
+another route, so the v6 ban path stays load-bearing rather than inert — and deleting those
+sets is what would make a later flip to dual-stack unsafe. Phase E keeps
+`bind_hosts: [0.0.0.0]`; drop nginx's `listen [::]:443` and `listen [::]:80` so that no HTTPS
+listener exists on an address nothing is told to use. Phase D's ACME `http-01` runs over v4.
+Phase H's `<PUBLIC_IP>` stays v4 throughout, and Phase L gates on v4 only. Phase C's `do-ip6`
+is still decided by the C2 egress test, independently of all of this.
+
+**If you want IPv4-only enforced at the socket**, the only thing that does it is binding the
+literal: `dns.bind_hosts: [<PUBLIC_IPV4>]`. A literal is not a wildcard, so `favoriteAddrFamily`
+falls through to the address's own family and you get a genuine `AF_INET` socket. Appending
+`'::'` to the list is neither this nor the dual-stack fix: `['0.0.0.0', '::']` binds `[::]:53`
+twice, dnsproxy sets `SO_REUSEADDR` **and** `SO_REUSEPORT` on every listener so the duplicate
+bind succeeds silently, and you gain nothing. Do not choose the literal without reading
+**Phase N** — AdGuardHome then fails to start whenever that address is not yet on an
+interface, which is exactly the state a floating-IP standby is in.
+
+**If you choose dual-stack**: the provider must give a static IPv6 that survives rebuild, on
+the same terms as check 5 above. Phase E's `dns.bind_hosts` does **not** change — the wildcard
+is already serving both families, and publishing the AAAA is the whole edit. Phase B's v6 sets
+must carry real rules rather than empty declarations, and every off-box check in B9 runs
+against `$PUB6` as well as `$PUB`. Phase D changes shape: once an AAAA exists, Let's Encrypt
+attempts `http-01` over IPv6 first, so nginx must already be answering on `[::]:80` before you
+publish the record or issuance becomes unreliable for a reason the ACME log states only
+obliquely. There is no IPv6 variant of the Phase H transport tests; the sweep that proves every
+published address answers on every transport is **E6 step 9**, run from a dual-stack host —
+it takes its address list from DNS rather than from `<PUBLIC_IP>`, so it fails precisely when a
+record has no listener behind it. Run it as soon as the AAAA is published, not at go-live.
+Phase L's gate covers both families or it covers neither.
+
+**The `do-ip6` decision belongs to Phase C, and C2 supplies the test.** Run C2's egress check —
+`ip -6 route show default` plus a query to two different root letters over IPv6 — on this host
+as soon as it is provisioned, rather than waiting until you are writing the Unbound config. It
+is deliberately not restated here: one copy of a test that decides one config line.
+
+The expensive case is not "no IPv6", it is *half* working IPv6, and that test is what catches
+it. With `do-ip6: yes` on a host whose v6 path blackholes, Unbound pays a full query timeout
+the first time it tries each v6 authoritative address; its infrastructure cache then demotes
+that address, and the penalty is re-paid every time the entry expires. The symptom is
+intermittent slowness on unrelated names, not an outage, and nothing in this plan alarms on
+it. Re-run C2's test after any provider network change, and record the answer in Q6 alongside
+the service-family decision.
 
 The v1 plan asserted this size without a model behind it. Here is the model. **Cache RAM
 is not the constraint on this box and never appears in the list of things that fail.**
@@ -32,6 +173,25 @@ including slab overhead; AdGuardHome's Go heap plus its in-memory query-log ring
 150–400 MB under load; nginx with a handful of workers is tens of MB. Total is roughly
 0.8–1.4 GB of 4 GB. There is no warmer daemon (decision 3), so nothing is budgeted for it.
 The problem is not the steady state, it is behaviour under pressure — see A6.
+
+**The monitoring stack is on this same host, is not optional, and is not in that number.**
+Phase I installs Prometheus, node_exporter, blackbox_exporter, Alertmanager and the
+Alertmanager-to-ntfy bridge here. Their ceilings, set in Phase I rather than in A6, sum to
+**1216 MB** (768 + 128 + 128 + 128 + 64); their steady state is nearer 300–600 MB, dominated
+by Prometheus and growing with its retention. So the honest figures for a complete build are
+**~1.1–2.0 GB steady state**, and **~4.3 GB if every ceiling in the plan were occupied at
+once** — A6's three DNS ceilings total 3056 MB and Phase I adds 1216 MB, against 4096 MB of
+RAM. That sum exceeding RAM is not an error; it is what "ceiling" means, and it is precisely
+why each A6 drop-in puts a `MemoryHigh` throttle underneath its `MemoryMax` and why the A6
+swapfile exists. It is also why 4 GB is the floor rather than a comfortable choice: 2 GB
+cannot run a build that includes Phase I, and Phase I is where the plan's only outage
+detection lives.
+
+If you would rather keep the resolver lean, move Prometheus and Alertmanager to a separate
+host and scrape across a private network. That removes ~900 MB of ceiling and 250–500 MB of
+steady state from this box, adds roughly EUR 5/month to the cost model below, and does not
+change the Phase I dead man's switch requirement — a monitoring host watching this box still
+needs something outside both watching it.
 
 **Throughput, per path.** These are planning estimates for 2 vCPU / 4 GB. Replace them
 with the measured numbers from the Phase H benchmark; do not quote them as results.
@@ -112,6 +272,27 @@ current market is nearer USD 90–150/month — plus ASN administration plus mul
 That is an order-of-magnitude cost increase for capability this service does not need. See
 Phase N for the redundancy design that the EUR 15–18 actually buys.
 
+**Egress, which that figure does not include and which is the line item an incident moves.**
+A DNS response is roughly 150–500 bytes on the wire, so 500 QPS sustained is about 5–20 GB a
+day — 150–600 GB a month — plus a few GB for the Phase I scrapes and the Phase K snapshots.
+That sits comfortably inside the included allowance on providers that bundle traffic (a
+typical bundle is ~20 TB) and is a real line item on providers that meter from the first
+byte. Ask three questions before you sign: is traffic included or metered, what does a
+terabyte of overage cost, and is there a packets-per-second cap. The third matters because
+the table above already treats "provider egress or packets-per-second cap being hit" as a
+scale-out trigger — it is cheaper to know the number now than to discover it as a throttle.
+
+**What an amplification incident costs in money, not in packets.** Phase B5's absolute egress
+cap is `4 mbytes/second` — 32 Mbit/s — chosen so a reflection incident cannot saturate the
+uplink. Sustained for 24 hours that is about **345 GB of egress you are billed for**,
+generated by traffic Phase J is correctly detecting and banning. Phase J's ban tiers bound
+the abuse; they do not bound the invoice, because every new source is answered until it is
+banned. On a metered provider, set a billing alert at your expected monthly volume. It is the
+earliest financial signal of an abuse event, and unlike every alert in Phase I it fires from
+outside the box and keeps working when the box does not. Then check what the provider does
+when a cap is exceeded: one whose remedy is a null-route has converted your billing event
+into an outage, and Phase B's cap is what keeps that outcome bounded rather than open-ended.
+
 **VERIFY**
 
 ```bash
@@ -120,6 +301,19 @@ nproc; free -g; df -h /
 ip -4 addr show scope global; ip -6 addr show scope global
 # the IP must survive a reboot:
 reboot   # then reconnect and re-check `ip -4 addr`
+
+# Recursion from the root is possible at all (check 2 above), on this host and
+# not just on the hourly instance you tested the provider with:
+dig +norecurse @198.41.0.4 . NS +noall +comments | grep -E 'flags:'   # `aa`, no `ra`
+
+# The two IPv6 answers, recorded in Q6 before Phase C and Phase E need them.
+# The egress test itself is C2's and is not duplicated here - run it from C2 now,
+# on this host, and carry the answer forward.
+echo "recursion egress family: do-ip6 ____ (per the C2 egress test)"
+echo "service family decision: ____ (IPv4-only = publish no AAAA)"
+
+# The off-box test host exists before Phase B, not before Phase H:
+ssh <TEST_HOST_IP> 'lsb_release -ds && echo TEST_HOST_REACHABLE'
 ```
 
 ---
@@ -151,7 +345,9 @@ Phase B. `libcap2-bin` is **not** needed — decision 8 means there is no `setca
 
 `chrony` is not optional on this host. DNSSEC signatures carry inception and expiration
 timestamps; a clock that drifts far enough makes Unbound SERVFAIL every signed zone, which
-presents as a total outage with no obvious cause.
+presents as a total outage with no obvious cause. Installing it is not sufficient — its own
+time sources must not depend on the resolver this plan builds, which is the subsection
+immediately after the package install.
 
 ```bash
 apt update && apt full-upgrade -y
@@ -170,7 +366,106 @@ systemctl enable --now chrony
 Automatic security updates are **not** configured here — that is Phase M, together with
 the upgrade and rollback procedure for the two daemons that live outside apt.
 
-**Free port 53 from systemd-resolved.** Ubuntu Server runs `systemd-resolved` with a stub
+#### Break the chrony/DNSSEC deadlock now, before Phase C makes it reachable
+
+Ubuntu's stock `/etc/chrony/chrony.conf` points at **hostnames** — `pool ntp.ubuntu.com`,
+`pool N.ubuntu.pool.ntp.org`. That is harmless today, because `/etc/resolv.conf` still names
+somebody else's resolver. It stops being harmless at Phase C5, which replaces that file with
+`nameserver 127.0.0.1` and no fallback, deliberately. From that moment the time path runs
+through AdGuardHome and Unbound, and the two dependencies close into a circle:
+
+> a skewed clock → Unbound cannot validate the root DNSKEY RRSIGs → **every** name SERVFAILs,
+> including names in unsigned zones, because Unbound cannot even prove the delegation
+> insecure → chrony cannot resolve `ntp.ubuntu.com` → no time source → nothing steps the
+> clock → the clock stays skewed.
+
+Nothing on the box breaks that loop, and the box does not look broken from outside: SSH to
+the IP still works, every service is `active (running)`, and the only symptom is that DNS
+returns SERVFAIL for everything — which reads as a resolver bug, so that is where the
+operator looks. Recovery needs the out-of-band console from check 6 in A1.
+
+This is not a theoretical shape. It is what a restored snapshot, a VM resumed from
+suspension, a host powered off for a month, a bad emulated RTC, or the Phase K restore drill
+onto a fresh instance all produce. Whether it bites at all currently depends on whether your
+provider's DHCP happens to hand chrony IP-literal servers via `sourcedir /run/chrony-dhcp` —
+which is luck, not design. Replace the luck:
+
+```bash
+install -d -m 0755 /etc/chrony/conf.d
+cat > /etc/chrony/conf.d/10-ip-literal.conf <<'EOF'
+# The time path MUST NOT depend on the DNS path. After Phase C5 this host
+# resolves only through its own validator, and a validator with a skewed clock
+# SERVFAILs every name - including the NTP pool names chrony needs to fix the
+# clock. Every source here is an IP literal for that reason. Never add a
+# hostname to this file.
+#
+# PREFER your provider's own NTP addresses if it publishes them: on-net, lower
+# latency, and not subject to a third party's routing. The Cloudflare anycast
+# literals below are the documented fallback
+# (https://developers.cloudflare.com/time-services/ntp/usage/), but Cloudflare
+# states the addresses may change - re-verify them at each Phase M review.
+server 162.159.200.1   iburst
+server 162.159.200.123 iburst
+
+# Step the clock whenever it is more than 1 s out, not only during the first
+# three updates after start. chrony.conf(5) on the second argument: "A negative
+# value disables the limit." Without this, a host that skews WHILE RUNNING -
+# resumed VM, drifting emulated RTC - slews instead of stepping and takes days
+# to close an hours-wide gap, SERVFAILing every signed zone throughout.
+makestep 1.0 -1
+EOF
+```
+
+Leave the stock `pool` lines alone. chrony retries name resolution in the background, so
+while DNS is down they simply contribute no usable source and resume when it recovers;
+deleting them costs source diversity for no gain.
+
+**Which `makestep` actually wins.** chrony applies the *last* occurrence of a directive, and
+Ubuntu's `chrony.conf` pulls in `conf.d` from a `confdir` line near the top while shipping
+its own `makestep 1 3` further down — so the stock line may override the one you just wrote.
+Do not reason about it; `chronyd -p` prints the fully merged configuration in read order,
+including everything pulled in by `confdir`, and settles it:
+
+```bash
+chronyd -p | grep -nE 'makestep|^server|^pool'
+# The LAST makestep printed is the effective one. If that is `makestep 1 3`
+# rather than `makestep 1.0 -1`, comment out the stock line in
+# /etc/chrony/chrony.conf and re-run this command.
+
+systemctl restart chrony
+chronyc sources -v
+```
+
+#### Recovering a host that is already deadlocked
+
+Symptom: every name SERVFAILs, signed and unsigned alike; `chronyc tracking` reports
+`Reference ID : 00000000` and `Leap status : Not synchronised`; SSH by IP address works
+normally. Check the clock **before** touching the resolver — if `timedatectl` is wrong by
+more than a few minutes, it is this and not a DNS fault. From the provider's out-of-band
+console, or from an SSH session opened by IP address, as root:
+
+```bash
+timedatectl                        # confirm the skew before changing anything
+systemctl stop chrony
+date -u -s '2026-08-03 14:07:00'   # UTC, read off any other machine with: date -u
+systemctl start chrony
+chronyc makestep                   # force the step rather than waiting for a slew
+chronyc tracking                   # want: Leap status Normal, offset < 100 ms
+systemctl restart unbound adguardhome
+dig +short deb.debian.org @127.0.0.1     # must answer now
+```
+
+`date -s` first and `chronyc makestep` second is deliberate: with the clock hours out,
+chrony's own step may still be gated by the update limit you have not fixed yet, while
+`date -s` needs no network and no source. Restarting Unbound afterwards is not cosmetic — it
+clears the validation failures and infrastructure-cache entries Unbound accumulated while the
+clock was wrong, which otherwise keep the outage alive for their own TTLs after the clock is
+correct. Phase K's restore drill is the most likely way you will meet this procedure; run it
+there deliberately rather than for the first time during an incident.
+
+#### Free port 53 from systemd-resolved
+
+Ubuntu Server runs `systemd-resolved` with a stub
 listener on `127.0.0.53:53`. AdGuardHome binds `0.0.0.0:53` in Phase E, which covers that
 address, so the bind fails and AGH will not start. On a host whose entire job is DNS, the
 least surprising outcome is to remove resolved from the picture and manage `/etc/resolv.conf`
@@ -230,6 +525,22 @@ cloud-init's `resolv_conf` module rather than fighting it with `chattr`.
 lsb_release -ds                        # Ubuntu 24.04.x LTS
 apt list --installed 2>/dev/null | grep -E '^(ufw|fail2ban)/' # expect no output
 chronyc tracking | grep -E 'Leap status|System time'          # Normal, offset < 100 ms
+
+# The time path does not depend on the DNS path. Check the merged CONFIG, not
+# `chronyc sources` - chronyc reverse-resolves what it displays, so a literal
+# and a pool name can look identical there.
+chronyd -p | grep -cE '^[[:space:]]*server[[:space:]]+[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+'
+#   expect >= 2 IP-literal server lines
+chronyd -p | grep -E 'makestep' | tail -1      # expect: makestep 1.0 -1
+
+# The real proof: chrony still syncs with name resolution taken away entirely.
+# This is the exact condition the host is in after a clock excursion post-C5.
+mv /etc/resolv.conf /etc/resolv.conf.off; systemctl restart chrony; sleep 20; \
+  chronyc tracking | head -2; mv /etc/resolv.conf.off /etc/resolv.conf
+# Reference ID must name one of the IP literals. `00000000` means the box would
+# not have recovered from a clock excursion after Phase C5 - fix it here, now,
+# while there is still a working resolver to fix it with.
+
 systemctl is-active systemd-resolved   # expect: inactive
 systemctl is-enabled systemd-resolved  # expect: masked
 ss -lnup 'sport = :53'                 # expect no output - port 53 is free
@@ -770,8 +1081,12 @@ reference these numbers rather than carrying their own.
 
 They are ceilings, not reservations. Their sum (1600 + 1200 + 256 MB) deliberately exceeds
 the 0.8–1.4 GB steady state from A1, so a spike in one daemon is absorbed instead of clipped,
-and stays far enough under 4 GB that all three sitting at their ceiling at once still leaves
-the kernel and sshd room to work.
+and all three sitting at their ceiling at once still leaves the kernel and sshd room to work.
+Add Phase I's 1216 MB of monitoring ceilings and the *plan-wide* total is ~4.3 GB against
+4 GB of RAM — see the budget in A1. That is over-subscription by design, and it is safe only
+because of the `MemoryHigh` throttles below and the swapfile above: what must never happen is
+every ceiling being occupied simultaneously, and what makes that observable before it happens
+is the throttle, not the ceiling.
 
 The `MemoryHigh` line ahead of each `MemoryMax` is what makes this safe to ship. A bare
 `MemoryMax` under `Restart=always` converts a slow leak into a restart loop — the same outage

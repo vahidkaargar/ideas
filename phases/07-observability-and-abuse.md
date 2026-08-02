@@ -609,6 +609,23 @@ modules:
       preferred_ip_protocol: ip4
       valid_rcodes: [SERVFAIL]
 
+  # The resolver's OWN name, asked of somebody else. Every other dns module
+  # here targets 127.0.0.1 and therefore cannot see the one dependency that
+  # takes every encrypted transport down at once: the authoritative DNS for
+  # dns.example.com is hosted by a third party, and if that delegation breaks
+  # or the registration lapses, DoT/DoH/DoQ clients cannot resolve the name
+  # they are configured with while this box stays entirely green. See I4c.
+  dns_own_name_public:
+    prober: dns
+    timeout: 5s
+    dns:
+      query_name: dns.example.com
+      query_type: A
+      transport_protocol: udp
+      preferred_ip_protocol: ip4
+      ip_protocol_fallback: false
+      valid_rcodes: [NOERROR]
+
   doh_get:
     prober: http
     timeout: 5s
@@ -737,6 +754,27 @@ Append the scrape jobs to `/etc/prometheus/prometheus.yml`. Replace `dns.example
       - target_label: __address__
         replacement: 127.0.0.1:9115
 
+  # Two independent public resolvers, so one provider's outage is a warning
+  # and not a page. The TARGET here is the resolver being asked; the name
+  # being asked for lives in the module. Neither address is your own, which
+  # is the entire point.
+  - job_name: blackbox-delegation
+    metrics_path: /probe
+    scrape_interval: 5m
+    params:
+      module: [dns_own_name_public]
+    static_configs:
+      - targets:
+          - '1.1.1.1:53'
+          - '9.9.9.9:53'
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: 127.0.0.1:9115
+
   - job_name: blackbox-tls
     metrics_path: /probe
     scrape_interval: 5m
@@ -756,6 +794,8 @@ Append the scrape jobs to `/etc/prometheus/prometheus.yml`. Replace `dns.example
 ```
 
 **The caveat that makes these probes weaker than they look.** Every probe above originates on the box. A packet addressed to your own public IP is routed over `lo`, so it hits Phase B's `iif lo accept` and never traverses the public input chain. These probes prove the *daemon and its TLS material* are healthy; they do **not** prove the service is reachable from the internet. Only an off-box check does that — see I9, which is why I9 exists in addition to, not instead of, this section.
+
+`blackbox-delegation` is the single exception, and it is exempt for a different reason: its packets genuinely leave the box, because the destination is somebody else's resolver. It still does not prove inbound reachability — it proves that the *name* clients are configured with still resolves. Two caveats on reading it. A public resolver answers from cache, so a delegation that breaks is invisible until the cached NS and A records age out; treat a firing alert as authoritative and a passing one as up to `TTL` stale. And a `probe_success` of 0 on both targets is far more likely to mean your egress is broken than that your registrar is — correlate with `RecursionStalled` before phoning anyone.
 
 #### I4b. DoT and DoQ resolution probes
 
@@ -848,6 +888,138 @@ systemctl enable --now blackbox_exporter \
 
 If Phase P puts the resolver behind WireGuard or an nftables allowlist, these probes must run **inside** the access path or they will report a permanent outage. That is a Phase P delta, not a Phase I one.
 
+#### I4c. Slow external checks: the domain registration and upstream releases
+
+Everything above measures things that fail in seconds. Two dependencies fail on a calendar instead, take the whole service with them, and are invisible to every signal in this phase.
+
+**The domain registration.** `dns.example.com` is the single name the service hangs from: the certificate Phase D issues, the SNI that DoT and DoQ clients present, the DoH URL, the `blackbox-doh`/`blackbox-tls` targets above, and — the one nobody expects — Phase P's WireGuard `Endpoint`, so even the private tunnel dies with the name. It is also the only expiry in this design that nothing else covers. `CertExpiringSoon` in I6 does not: a certificate cannot renew for a domain you no longer control, so that alert would fire at 14 days with no fixable cause while the operator spent the last five days re-running certbot. The failure is closed and total — Android Private DNS accepts one hostname and has no client-side failover — and after the redemption window anyone may register the lapsed name, obtain a valid certificate for it, and receive the queries of every device still configured to trust it. That last consequence is why Phase D's CAA guidance matters; it is not restated here.
+
+**The out-of-apt binaries.** Phase M's `unattended-upgrades` covers the apt security pockets, which is `unbound` and `nginx` and structurally nothing else. Six components on this box come from upstream tarballs and are patched only when a human decides to patch them: AdGuardHome (Phase E, pinned), `restic` (Phase K), `prometheus` and `node_exporter` (I1), `alertmanager` (I8), `blackbox_exporter` (I4). AdGuardHome runs with `--no-check-update` deliberately — an edge daemon that can rewrite its own binary is worse than an unpatched one — but the deliberate choice removed the only thing that would have told anyone a release exists. Phase M says to read the release notes before every upgrade; this is what tells you there is an upgrade to read notes about. **This check never upgrades anything.** It reports, and Phase M's operator-invoked procedure does the work.
+
+Both are gauges with a duration, so they belong to Prometheus and Alertmanager rather than to `notify.sh` — I8b's rule against notifying on a timer applies exactly here, since a weekly "your domain expires in 47 days" push is a channel that stops being read by the third week. Two cron jobs write textfile metrics; I6 alerts on them.
+
+```bash
+cat > /usr/local/sbin/dns-domain-expiry <<'EOF'
+#!/bin/bash
+# Registry expiry date for the service domain -> node_exporter textfile.
+# RDAP, not whois: whois output is unparseable per-registry free text, while
+# RDAP is JSON with a defined `expiration` event (RFC 9083 s4.5).
+set -u
+DOMAIN=example.com          # the REGISTERED domain, not the dns.* hostname
+OUT=/var/lib/node_exporter/textfile/dns_domain.prom
+TMP="${OUT}.tmp"
+
+# -L is mandatory. rdap.org is the IANA bootstrap redirector: it answers 302
+# to the responsible registry (e.g. rdap.verisign.com for .com). Without -L
+# curl returns an empty body and this reports a permanent, silent failure.
+EXP=$(curl -fsSL --max-time 20 "https://rdap.org/domain/${DOMAIN}" 2>/dev/null \
+      | jq -r '.events[]? | select(.eventAction=="expiration") | .eventDate' | head -1)
+
+{
+  echo '# TYPE dns_domain_rdap_up gauge'
+  echo '# TYPE dns_domain_expiry_seconds gauge'
+  if [ -n "$EXP" ] && EPOCH=$(date -d "$EXP" +%s 2>/dev/null); then
+    printf 'dns_domain_rdap_up{domain="%s"} 1\n' "$DOMAIN"
+    printf 'dns_domain_expiry_seconds{domain="%s"} %s\n' "$DOMAIN" "$EPOCH"
+  else
+    # Emit up=0 and NO expiry sample. A stale expiry that keeps counting down
+    # from a cached value is worse than an absent one: it would clear itself.
+    printf 'dns_domain_rdap_up{domain="%s"} 0\n' "$DOMAIN"
+  fi
+} > "$TMP"
+
+chmod 0644 "$TMP"; mv "$TMP" "$OUT"
+EOF
+chmod 0750 /usr/local/sbin/dns-domain-expiry
+```
+
+Confirm the RDAP shape for **your** TLD before trusting it — a handful of ccTLD registries publish RDAP without an `expiration` event, in which case this reports `up 0` forever and you need the registrar's own reminder emails plus a calendar entry instead:
+
+```bash
+curl -fsSL https://rdap.org/domain/example.com | jq -r '.events[] | "\(.eventAction)=\(.eventDate)"'
+# EXPECTED: a line beginning `expiration=`, e.g. expiration=2026-08-13T04:00:00Z
+```
+
+```bash
+cat > /usr/local/sbin/dns-release-check <<'EOF'
+#!/bin/bash
+# Installed vs upstream version for every component apt does not patch.
+# Reports only; never downloads, never upgrades. See Phase M for the upgrade.
+set -u
+OUT=/var/lib/node_exporter/textfile/dns_releases.prom
+TMP="${OUT}.tmp"
+FAILED=0
+
+latest() {   # latest <owner/repo> -> tag with any leading v stripped
+  curl -fsS --max-time 20 "https://api.github.com/repos/$1/releases/latest" \
+    | jq -r '.tag_name // empty' | sed 's/^v//'
+}
+
+{
+  echo '# TYPE dns_component_update_available gauge'
+  echo '# TYPE dns_release_check_up gauge'
+
+  emit() {   # emit <component> <installed> <repo>
+    local comp="$1" have="$2" repo="$3" want
+    want=$(latest "$repo") || true
+    if [ -z "$have" ] || [ -z "$want" ]; then FAILED=1; return; fi
+    # Only emit the series when there IS drift. An absent series means "up to
+    # date", which keeps this at zero cost in the cardinality budget (I1) for
+    # the years between releases.
+    [ "$have" = "$want" ] && return
+    printf 'dns_component_update_available{component="%s",installed="%s",latest="%s"} 1\n' \
+      "$comp" "$have" "$want"
+  }
+
+  # AdGuardHome: read the symlink Phase E installs, not --version. The symlink
+  # is what Phase M moves, so it is the truth about what would roll back.
+  emit adguardhome \
+    "$(basename "$(readlink -f /opt/adguardhome/current)" | sed 's/^v//')" \
+    AdguardTeam/AdGuardHome
+
+  # Prometheus-family binaries print `<name>, version X.Y.Z (...)` on STDERR.
+  emit prometheus        "$(prometheus --version 2>&1        | awk 'NR==1{print $3}')" prometheus/prometheus
+  emit node_exporter     "$(node_exporter --version 2>&1     | awk 'NR==1{print $3}')" prometheus/node_exporter
+  emit alertmanager      "$(alertmanager --version 2>&1      | awk 'NR==1{print $3}')" prometheus/alertmanager
+  emit blackbox_exporter "$(blackbox_exporter --version 2>&1 | awk 'NR==1{print $3}')" prometheus/blackbox_exporter
+  # restic prints `restic X.Y.Z compiled with ...` on stdout.
+  emit restic            "$(restic version 2>/dev/null       | awk 'NR==1{print $2}')" restic/restic
+
+  echo "dns_release_check_up $((1 - FAILED))"
+} > "$TMP"
+
+chmod 0644 "$TMP"; mv "$TMP" "$OUT"
+EOF
+chmod 0750 /usr/local/sbin/dns-release-check
+```
+
+Six unauthenticated calls a week sits far inside GitHub's 60-per-hour-per-IP anonymous limit; running this hourly would not. Verify each version parse by hand once — a field-position change turns every component into permanent drift, which is the same channel-poisoning failure as notifying on a timer:
+
+```bash
+/usr/local/sbin/dns-release-check && cat /var/lib/node_exporter/textfile/dns_releases.prom
+# EXPECTED on a freshly built host: `dns_release_check_up 1` and no
+# dns_component_update_available lines at all. Any line here means either a
+# genuine new release or a broken version parse -- check which before filing it.
+prometheus --version 2>&1 | head -1     # confirm field 3 is the bare version
+restic version | head -1                # confirm field 2 is the bare version
+```
+
+**Append to `/etc/cron.d/dns-health`** — Phase I's file, created in I10; append, never rewrite:
+
+```bash
+cat >> /etc/cron.d/dns-health <<'EOF'
+
+# I4c: slow external dependencies. Both write node_exporter textfiles and
+# notify nobody -- I6 owns the alerting, so that Alertmanager can dedupe a
+# condition that stays true for weeks. Offset from the 06:17 health gate so a
+# 20s curl timeout cannot delay it.
+41 4 * * *   root /usr/local/sbin/dns-domain-expiry
+53 4 * * 1   root /usr/local/sbin/dns-release-check
+EOF
+```
+
+Both files land in the same textfile directory that node_exporter scrapes, and both are refreshed on a scale of days. That breaks `CollectorStale` as written — it fires on *any* textfile older than five minutes — so I6 excludes these two by name and covers them with a separate rule at a matching timescale. If you add a third slow collector, add it to both.
+
 ### I5. Abuse counters
 
 Phase B defines the nftables ban sets, meters and counters — `banned_ips`, `banned_ips6`, `banned_long`, `banned_long6`, `floodmeter4`, `floodmeter6`, `dns_dropped`, `dns_banned`, all inside `table inet filter`. Phase J ships `/usr/local/sbin/nft-abuse-textfile`, which reads those objects and writes `nft_dns_dropped_packets`, `nft_dns_banned_packets` and `nft_banned_ips_elements` into the same textfile directory. Phase I only consumes them (I6 alerts, I7 SLO corroboration). Do not duplicate the exporter here.
@@ -875,14 +1047,36 @@ groups:
 
       # A stale textfile means a collector timer died. Without this, a dead
       # collector looks exactly like a healthy service with flat counters.
+      # The I4c files are written daily and weekly, not every minute, so they
+      # are excluded here and covered by SlowCollectorStale below. Adding a
+      # slow collector without adding it to BOTH matchers gives you a rule
+      # that fires forever, which is how a whole alerting stack gets muted.
       - alert: CollectorStale
-        expr: time() - node_textfile_mtime_seconds > 300
+        expr: >-
+          time() - node_textfile_mtime_seconds{file!~"dns_domain.prom|dns_releases.prom"} > 300
         for: 5m
         labels:
           severity: warning
         annotations:
           summary: "Textfile collector {{ $labels.file }} is stale"
           description: "No update for >5 minutes. Metrics derived from it are frozen, not zero."
+
+      # The I4c calendar collectors, at their own timescale: 36h for the daily
+      # domain check, 8d for the weekly release check. The `file` label is the
+      # BASENAME, not the path.
+      - alert: SlowCollectorStale
+        expr: >-
+          time() - node_textfile_mtime_seconds{file="dns_domain.prom"} > 129600
+            or time() - node_textfile_mtime_seconds{file="dns_releases.prom"} > 691200
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "Slow collector {{ $labels.file }} has not run"
+          description: >-
+            Its cron line in /etc/cron.d/dns-health did not run, or the file was
+            never created. The dependency it watches is now unmonitored, and the
+            expiry it watches keeps counting down regardless. See I4c.
 
       - alert: TextfileScrapeError
         expr: node_textfile_scrape_error != 0
@@ -990,6 +1184,37 @@ groups:
         annotations:
           summary: "A correctly-signed name is not resolving"
           description: "Stale or empty root.key SERVFAILs everything. See Phase C."
+
+      # Deliberately adjacent to the two DNSSEC rules, because a dead clock
+      # presents as exactly the same outage and the entire Phase C trust-anchor
+      # diagnostic path comes back clean. `node_timex_*` needs no collector
+      # work: the timex collector is default-enabled on Linux and reads
+      # adjtimex(2), so ProtectSystem=strict in I1 does not touch it.
+      - alert: ClockUnsynchronised
+        expr: node_timex_sync_status == 0
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "System clock is not disciplined by chrony"
+          description: >-
+            RRSIG inception and expiration are absolute timestamps, so Unbound
+            starts SERVFAILing every signed zone once drift crosses the validity
+            window -- long before the wrongness is visible to a human, and
+            indistinguishable from a broken trust anchor. Discriminator:
+            `timedatectl` reports "System clock synchronized: no", while
+            `test -s /var/lib/unbound/root.key` PASSES and will mislead you.
+            Fix with `systemctl start chrony && chronyc makestep`, not with
+            anything in Phase C. See Phase A for the chrony install.
+
+      - alert: ClockOffsetHigh
+        expr: abs(node_timex_offset_seconds) > 0.5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Clock offset {{ $value | printf \"%.2f\" }}s"
+          description: "Leading indicator for ClockUnsynchronised. chrony is running but not converging: check `chronyc sources -v` for reachable peers, and Phase B for egress on UDP/123."
 
       - alert: ServfailRateHigh
         expr: >-
@@ -1183,9 +1408,18 @@ groups:
           summary: "The kernel OOM-killed a process in the last 15 minutes"
           description: "Find out which one before assuming the service recovered."
 
+      # chrony belongs here, and this is the rule that actually catches it.
+      # ClockUnsynchronised cannot: when chronyd dies the kernel does not clear
+      # STA_UNSYNC immediately. `second_overflow()` in kernel/time/ntp.c grows
+      # time_maxerror by MAXFREQ/NSEC_PER_USEC = 500 us per second and only sets
+      # STA_UNSYNC once it passes NTP_PHASE_LIMIT = 16 s, i.e. after roughly
+      # 16000000/500 = 32000 s, about NINE HOURS of undetected free-running
+      # drift. This rule notices in three minutes. Confirm the unit name on
+      # your build with `systemctl list-units 'chron*'` -- it is chrony.service
+      # on Ubuntu 24.04, chronyd.service on the RPM family.
       - alert: ServiceInactive
         expr: >-
-          node_systemd_unit_state{name=~"unbound.service|adguardhome.service|nginx.service",state="active"} == 0
+          node_systemd_unit_state{name=~"unbound.service|adguardhome.service|nginx.service|chrony.service",state="active"} == 0
         for: 3m
         labels:
           severity: critical
@@ -1194,7 +1428,7 @@ groups:
 
       - alert: ServiceFlapping
         expr: >-
-          changes(node_systemd_unit_state{name=~"unbound.service|adguardhome.service|nginx.service",state="active"}[1h]) > 5
+          changes(node_systemd_unit_state{name=~"unbound.service|adguardhome.service|nginx.service|chrony.service",state="active"}[1h]) > 5
         labels:
           severity: warning
         annotations:
@@ -1236,6 +1470,96 @@ groups:
           description: >-
             Either a distributed flood or a spoofed-source run steering the ban
             set at your own users. Read Phase J8 before widening anything.
+
+  # ----------------------------------------------------------- dependencies
+  # Calendar failures, from the I4c collectors. Thresholds are in DAYS because
+  # that is the unit the fix is measured in -- a registrar billing problem is
+  # not resolved in an afternoon.
+  - name: dependencies
+    rules:
+      - alert: DomainExpiringSoon
+        expr: (dns_domain_expiry_seconds - time()) / 86400 < 60
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.domain }} registration expires in {{ $value | printf \"%.0f\" }} days"
+          description: >-
+            Renew now. This is NOT the certificate alert and CertExpiringSoon
+            will not save you: certbot cannot issue for a domain you no longer
+            control. The usual root cause is an expired card on the registrar
+            account, which takes longer to fix than it sounds.
+
+      - alert: DomainExpiringCritical
+        expr: (dns_domain_expiry_seconds - time()) / 86400 < 30
+        for: 1h
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.domain }} registration expires in under 30 days"
+          description: >-
+            At expiry every transport fails closed at once -- Do53 by hostname,
+            DoT and DoQ SNI, the DoH URL, and Phase P's WireGuard endpoint --
+            and no client has a fallback. After the redemption window the name
+            can be re-registered by anyone, who can then obtain a valid
+            certificate for it and receive your users' queries.
+
+      - alert: DomainExpiryCheckFailing
+        expr: dns_domain_rdap_up == 0
+        for: 6h
+        labels:
+          severity: warning
+        annotations:
+          summary: "RDAP lookup for {{ $labels.domain }} is failing"
+          description: >-
+            The expiry countdown is now ABSENT, not zero, so the two rules above
+            cannot fire. Registry RDAP outage, an egress block, or a TLD with no
+            `expiration` event -- see I4c. Until it returns, the renewal date is
+            whatever your calendar says.
+
+      - alert: DelegationUnresolvable
+        expr: probe_success{job="blackbox-delegation"} == 0
+        for: 30m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.instance }} cannot resolve this resolver's own hostname"
+          description: >-
+            Authoritative DNS for the service name is broken, or the
+            registration lapsed. Every encrypted client fails while this box
+            reports itself perfectly healthy. If BOTH public resolvers fail
+            simultaneously, suspect your own egress first and correlate with
+            RecursionStalled. The long `for` is deliberate: public resolvers
+            cache, so brief single-target blips are noise.
+
+      - alert: ComponentUpdateAvailable
+        expr: dns_component_update_available == 1
+        for: 24h
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.component }} {{ $labels.installed }} -> {{ $labels.latest }} available"
+          description: >-
+            unattended-upgrades (Phase M) covers the apt pockets and therefore
+            cannot cover this binary. AdGuardHome and nginx are the two
+            processes that parse hostile input from the whole internet, so an
+            AdGuardHome release is the one to read the notes for first. Upgrade
+            via Phase M's procedure -- this alert deliberately does not
+            auto-upgrade anything. Silence it if you have chosen to stay on the
+            pinned version; do not delete the rule.
+
+      - alert: ReleaseCheckFailing
+        expr: dns_release_check_up == 0
+        for: 24h
+        labels:
+          severity: warning
+        annotations:
+          summary: "The upstream release check could not complete"
+          description: >-
+            A version parse broke, a binary is missing, or the GitHub API is
+            unreachable or rate-limiting. Every out-of-apt component is
+            unwatched until this clears. Run /usr/local/sbin/dns-release-check
+            by hand and read its output.
 ```
 
 ### I7. Recording rules, SLIs and SLOs
@@ -1578,6 +1902,8 @@ Equivalent substitutions, in preference order if you already own a second host: 
 
 Record both external services, their credentials location, and the phone numbers/emails they notify in the Phase O inventory. An external dependency nobody documented is an external dependency that silently lapses.
 
+Two more belong in that same inventory, and they are the ones operators forget because no daemon represents them. **The domain registration** — registrar, account identity, who else can log in, whether auto-renew is on, whether the registrar lock is on, and the expiry date of the card that pays for it, since a dead card is the usual root cause of a dead domain. **The authoritative DNS hosting for that name**, which may or may not be the same company. I4c monitors the registration's expiry date and `blackbox-delegation` monitors whether the name still resolves, but neither can monitor an account nobody can get into. There is a decision embedded here that this plan will not make for you: a registrar whose account recovery goes to a mailbox at the domain being registered is a circular dependency that becomes unrecoverable at exactly the wrong moment. **Recommended default: use a recovery address on an unrelated domain, enable registrar lock and auto-renew, and put the registrar account behind its own MFA.** If the resolver is shared with anyone else, name a second person who can renew it.
+
 ### I10. `dns-health` — the single operator script
 
 One command, run by a human before and after every change, and by the Phase L checklist. It reports; it does not fix. Exit status 0 means everything passed.
@@ -1594,8 +1920,11 @@ bad()  { say "$1" "FAIL $2"; FAIL=1; }
 chk()  { if eval "$2" >/dev/null 2>&1; then ok "$1" "${3:-}"; else bad "$1" "${3:-}"; fi; }
 
 echo "== units =="
+# chrony is in this list for the same reason it is in ServiceInactive: a dead
+# clock SERVFAILs every signed zone, and node_timex_sync_status takes about
+# nine hours to notice. `is-active` notices immediately.
 for u in unbound adguardhome nginx prometheus alertmanager alertmanager-ntfy \
-         node_exporter blackbox_exporter nftables; do
+         node_exporter blackbox_exporter nftables chrony; do
   chk "$u" "systemctl is-active --quiet $u"
 done
 for t in unbound-textfile.timer agh-textfile.timer dns-probe-textfile.timer; do
@@ -1621,6 +1950,15 @@ if [ "$(dig @127.0.0.1 sigfail.verteiltesysteme.net A +time=3 +tries=1 \
   ok "DNSSEC bogus name SERVFAILs"
 else
   bad "DNSSEC bogus name SERVFAILs" "validation bypassed -- see Phase C/E"
+fi
+
+echo "== clock =="
+# Cheap, and it is the discriminator for the outage that looks like a broken
+# trust anchor. `timedatectl show` is machine-readable; the pretty output is not.
+if [ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" = "yes" ]; then
+  ok "clock synchronised" "$(chronyc tracking 2>/dev/null | awk -F': *' '/System time/{print $2}')"
+else
+  bad "clock synchronised" "signed zones will SERVFAIL -- this is NOT Phase C"
 fi
 
 echo "== exposure =="
@@ -1659,6 +1997,25 @@ for p in 443 853; do
     bad "cert :$p" "no certificate returned"
   fi
 done
+
+echo "== dependencies =="
+# Read I4c's textfile rather than calling RDAP: this script must stay fast and
+# must not depend on a third party being up to report a green box.
+DOMEXP=$(awk '/^dns_domain_expiry_seconds/{print $2}' \
+  /var/lib/node_exporter/textfile/dns_domain.prom 2>/dev/null)
+if [ -n "${DOMEXP:-}" ]; then
+  DDAYS=$(( (${DOMEXP%.*} - $(date +%s)) / 86400 ))
+  [ "$DDAYS" -gt 30 ] && ok "domain registration" "${DDAYS}d left" \
+                      || bad "domain registration" "${DDAYS}d left -- renew NOW"
+else
+  bad "domain registration" "no expiry metric -- see I4c"
+fi
+# awk, not `grep -c ... || echo 0`: grep exits 1 when it matches nothing, so
+# the fallback fires IN ADDITION to grep's own "0" and prints "0 0" on exactly
+# the healthy path. awk always exits 0 and always prints one number.
+PEND=$(awk '/^dns_component_update_available/{n++} END{print n+0}' \
+  /var/lib/node_exporter/textfile/dns_releases.prom 2>/dev/null)
+printf '%-42s %s\n' "upstream releases pending" "${PEND:-0} (see Phase M to apply)"
 
 echo
 [ $FAIL -eq 0 ] && echo "ALL CHECKS PASSED" || echo "FAILURES PRESENT -- see above"
@@ -1812,6 +2169,65 @@ journalctl -u cron --since '-5 min' | grep -i 'dns-health' || true   # no parse 
 
 # 17. The operator script agrees.
 /usr/local/sbin/dns-health; echo "exit=$?"
+
+# 18. The clock is actually monitored. Both series must EXIST -- an alert on a
+#     metric no collector emits is dead code that never fires.
+curl -s 127.0.0.1:9100/metrics | grep -E '^node_timex_(sync_status|offset_seconds) '
+# EXPECTED: node_timex_sync_status 1, and an offset within a few milliseconds.
+# If both lines are ABSENT the timex collector is off; do not "fix" it by
+# adding --collector.timex (it is default-on) -- find out what disabled it.
+curl -s 127.0.0.1:9100/metrics | grep 'node_systemd_unit_state.*chrony'
+# EXPECTED: a chrony.service line with state="active" value 1. If the unit is
+# named chronyd.service on your build, fix the regex in ServiceInactive to
+# match, or the rule silently covers nothing.
+
+# 19. Prove the chrony alert path end to end, cheaply and reversibly. This is
+#     the DETECTION test only; the full "clock skew SERVFAILs every signed
+#     zone" rehearsal belongs to Phase H's validation suite, not here.
+#     Restore detached so an interrupted shell cannot leave the clock adrift.
+systemctl stop chrony
+( sleep 300; systemctl start chrony; chronyc makestep ) >/dev/null 2>&1 &
+sleep 240; curl -s 127.0.0.1:9093/api/v2/alerts | jq -r '.[].labels.alertname' | grep ServiceInactive
+# EXPECTED: ServiceInactive fires within ~3 minutes. ClockUnsynchronised will
+# NOT have fired and that is correct -- the kernel needs about nine hours to
+# set STA_UNSYNC (see the comment on ServiceInactive in I6), which is precisely
+# why chrony is in the unit-state rule and not left to the timex metric alone.
+timedatectl show -p NTPSynchronized --value    # confirm `yes` again afterwards
+
+# 20. The domain expiry countdown exists and is sane.
+/usr/local/sbin/dns-domain-expiry && cat /var/lib/node_exporter/textfile/dns_domain.prom
+# EXPECTED: dns_domain_rdap_up 1 and an epoch. Convert it and sanity-check it
+# against what the registrar's control panel says -- they must agree:
+awk '/^dns_domain_expiry_seconds/{print $2}' \
+  /var/lib/node_exporter/textfile/dns_domain.prom | xargs -I{} date -d @{}
+curl -sf --get 127.0.0.1:9090/api/v1/query \
+  --data-urlencode 'query=(dns_domain_expiry_seconds - time()) / 86400' | jq -r '.data.result[].value[1]'
+# EXPECTED: days remaining, matching the registrar. A NEGATIVE number means the
+# domain has already expired and every encrypted transport is living on cache.
+
+# 21. The release check is honest about both outcomes.
+/usr/local/sbin/dns-release-check && cat /var/lib/node_exporter/textfile/dns_releases.prom
+# EXPECTED on a freshly built host: `dns_release_check_up 1` and NO
+# dns_component_update_available lines. `up 0` means a version parse broke --
+# find which by running the emit commands from I4c by hand.
+
+# 22. The slow collectors do not poison CollectorStale. Run this the day AFTER
+#     the collectors first wrote, i.e. once both files are older than 5 minutes.
+curl -sf --get 127.0.0.1:9090/api/v1/query \
+  --data-urlencode 'query=ALERTS{alertname="CollectorStale"}' | jq -r '.data.result | length'
+# EXPECTED: 0. Anything else means the file!~ exclusion in I6 does not match the
+# real basenames -- compare against the `file` labels actually being exported:
+curl -s 127.0.0.1:9100/metrics | grep '^node_textfile_mtime_seconds'
+
+# 23. All 43 rules loaded, and every new one is present rather than silently
+#     dropped by a YAML error higher up the file.
+curl -sf 127.0.0.1:9090/api/v1/rules | jq -r '.data.groups[].rules[].name' | sort > /tmp/loaded
+for a in ClockUnsynchronised ClockOffsetHigh SlowCollectorStale DomainExpiringSoon \
+         DomainExpiringCritical DomainExpiryCheckFailing DelegationUnresolvable \
+         ComponentUpdateAvailable ReleaseCheckFailing; do
+  grep -qx "$a" /tmp/loaded && echo "ok   $a" || echo "MISSING $a"
+done
+# EXPECTED: `ok` on all nine.
 ```
 
 ---
