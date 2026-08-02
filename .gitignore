@@ -1,0 +1,13 @@
+# macOS
+.DS_Store
+
+# Python tooling caches, from linting or scripting against this repo
+.ruff_cache/
+__pycache__/
+*.py[cod]
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*~
