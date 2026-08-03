@@ -1,4 +1,7 @@
-# ideas
+# Keystone DNS
+
+DNSSEC validation is anchored on the root zone's Key Signing Key — the "keystone" of the
+whole trust chain, and the piece this design is built around rather than delegating away.
 
 ## DNS server plan
 
