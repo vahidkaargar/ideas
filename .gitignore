@@ -11,3 +11,6 @@ __pycache__/
 .idea/
 *.swp
 *~
+
+# Personal Claude Code overrides — .claude/settings.json (hooks, permissions) is checked in
+.claude/settings.local.json

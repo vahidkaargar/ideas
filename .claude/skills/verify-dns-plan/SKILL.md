@@ -29,6 +29,12 @@ It exits 0 and prints `PASS` when everything checks out, or exits non-zero and p
 `FAIL` with a numbered list of `file:line` errors. There is no flag to silence individual
 checks — if something fails, it is meant to be looked at, not suppressed.
 
+**Also runs automatically.** A PostToolUse hook (`.claude/hooks/verify-dns-plan.sh`, wired
+in `.claude/settings.json`) runs this same check after every Edit/Write to
+`dns-server-plan.md` or `phases/*.md` and feeds a `FAIL` straight back as blocking feedback —
+Hard Rule 6 no longer depends on remembering to invoke this skill. Manual invocation is still
+useful: before committing, or to re-check the repo without making another edit.
+
 ## Reading the output
 
 Each error category means a different kind of fix:

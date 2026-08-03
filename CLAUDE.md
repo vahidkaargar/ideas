@@ -102,7 +102,18 @@ Two tiers, matching this user's global convention (STRICT / PREFER / OPTIONAL in
   install `pyyaml` (`pip install pyyaml`) to enable the YAML-syntax check, or it degrades to
   a warning and skips that one check.
 - **Skill: `verify-dns-plan`** (`.claude/skills/verify-dns-plan/`) — wraps the script for
-  invocation via the Skill tool.
+  invocation via the Skill tool. Mechanical, post-edit checks only.
+- **Skill: `edit-dns-plan`** (`.claude/skills/edit-dns-plan/`) — pre-edit checklist for hard
+  rules 1, 2, 3, 4, 5, 7, 8: the Architecture Decisions table, the single-ownership table,
+  filename collisions, sourced claims, and phase-letter citations. None of that is
+  mechanically checkable, so it's a checklist, not a script.
+- **Hook: `.claude/hooks/verify-dns-plan.sh`** (wired in `.claude/settings.json`, `PostToolUse`
+  on `Edit|Write`) — runs `scripts/verify_plan.py` automatically whenever `dns-server-plan.md`
+  or a file under `phases/` is touched, and feeds a `FAIL` back as blocking feedback. This is
+  hard rule 6 mechanized: it no longer depends on remembering to invoke the skill by hand.
+  Silent, and a no-op, on every other file. If it doesn't seem to be firing in an existing
+  session, reopen `/hooks` once (the config watcher only watches directories that had a
+  settings file when the session started) or start a new session.
 - **No MCP servers are required for this repo.** It has no live API, database, or running
   service to integrate with — the deliverable is a document. (Context7 is used ad hoc for
   researching the *content* of the plan — AdGuardHome/Unbound/nftables/systemd behavior —

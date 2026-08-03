@@ -1,0 +1,22 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/verify-dns-plan.sh",
+            "timeout": 30,
+            "statusMessage": "Verifying DNS plan structure (scripts/verify_plan.py)..."
+          }
+        ]
+      }
+    ]
+  },
+  "permissions": {
+    "allow": [
+      "Bash(python3 scripts/verify_plan.py)"
+    ]
+  }
+}
